@@ -5,6 +5,9 @@ const limit = 50;
 let nextCursor = 0;
 let activeSessionId = '';
 let activeUserId = '';
+let isHistoryLoading = false;
+const avatarPreloadCache = new Map();
+const avatarResolvedCache = new Map();
 
 window.copyToClipboard = (text) => {
     if (!text) return;
@@ -21,9 +24,32 @@ window.copyToClipboard = (text) => {
 };
 window.userMap = {};
 window.globalTopUsers = [];
+const memberPageSize = 10;
+const memberInitialPageMax = 30;
+const memberAutoFillMaxRequests = 6;
+let sidebarMemberUsers = [];
+let rankMemberUsers = [];
+let memberOffset = 0;
+let memberTotal = 0;
+let memberHasMore = false;
+let rankOffset = 0;
+let rankTotal = 0;
+let rankHasMore = false;
+let memberSearchKeyword = '';
+let memberSearchTimer = null;
+let memberRequestSeq = 0;
+let rankRequestSeq = 0;
+let memberAutoFillPending = false;
+let memberAutoFillCount = 0;
 let filterStart = 0;
 let filterEnd = 0;
 let activeMsgType = '';
+
+function getInitialMemberLimit() {
+    const height = window.innerHeight || document.documentElement.clientHeight || 900;
+    const estimated = Math.ceil((height - 180) / 74);
+    return Math.max(memberPageSize, Math.min(memberInitialPageMax, estimated));
+}
 
 
 async function fetchAPI(endpoint, method = 'GET', body = null) {
@@ -148,6 +174,85 @@ function safeCount(value) {
     return Number.isFinite(n) ? n : 0;
 }
 
+function getImageDisplayStyle(width, height) {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0 || width > 100000 || height > 100000) {
+        return '';
+    }
+
+    const ratio = width / height;
+    let maxWidth = 520;
+    let maxHeight = 420;
+
+    if (ratio >= 2.4) {
+        maxWidth = 560;
+        maxHeight = 240;
+    } else if (ratio >= 1.25) {
+        maxWidth = 540;
+        maxHeight = 380;
+    } else if (ratio <= 0.45) {
+        maxWidth = 300;
+        maxHeight = 520;
+    } else if (ratio <= 0.8) {
+        maxWidth = 360;
+        maxHeight = 500;
+    } else {
+        maxWidth = 440;
+        maxHeight = 440;
+    }
+
+    let scale = Math.min(maxWidth / width, maxHeight / height, 1);
+    const longEdge = Math.max(width, height);
+    if (longEdge < 180) {
+        scale = Math.min(maxWidth / width, maxHeight / height, 180 / longEdge, 2.5);
+    }
+
+    const displayWidth = Math.max(48, Math.round(width * scale));
+    return ` style="width:${displayWidth}px;max-width:100%;aspect-ratio:${width}/${height};"`;
+}
+
+function formatSessionPreview(text) {
+    if (!text) return '';
+    return String(text)
+        .replace(/\[CQ:image,[^\]]*\]/g, '[图片]')
+        .replace(/\[CQ:video,[^\]]*\]/g, '[视频]')
+        .replace(/\[CQ:record,[^\]]*\]/g, '[语音]')
+        .replace(/\[CQ:face,[^\]]*\]/g, '[表情]')
+        .replace(/\[CQ:at,qq=all[^\]]*\]/g, '@全体成员')
+        .replace(/\[CQ:at,qq=([^\],]+)[^\]]*\]/g, '@$1')
+        .replace(/\[CQ:reply,[^\]]*\]/g, '[回复]')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function debounceMemberSearch(value) {
+    memberSearchKeyword = safeText(value).trim();
+    clearTimeout(memberSearchTimer);
+    memberSearchTimer = setTimeout(() => {
+        fetchMembers({ target: 'sidebar', keyword: memberSearchKeyword, offset: 0, append: false });
+    }, 180);
+}
+
+function toggleCategory(header, content) {
+    const willCollapse = !header.classList.contains('collapsed');
+    header.classList.toggle('collapsed', willCollapse);
+
+    if (willCollapse) {
+        content.style.maxHeight = `${content.scrollHeight}px`;
+        content.offsetHeight;
+        content.classList.add('hidden');
+    } else {
+        content.style.maxHeight = '0px';
+        content.classList.remove('hidden');
+        content.offsetHeight;
+        content.style.maxHeight = `${content.scrollHeight}px`;
+        const clearHeight = () => {
+            if (!content.classList.contains('hidden')) content.style.maxHeight = '';
+            content.removeEventListener('transitionend', clearHeight);
+        };
+        content.addEventListener('transitionend', clearHeight);
+    }
+}
+
 function formatMsg(text) {
     if (!text) return "";
 
@@ -187,14 +292,19 @@ function formatMsg(text) {
             url = proxyUrl(url);
             if (!isSafeUrl(url)) return `<span class="msg-tag">🖼️ [图片]</span>`;
             const safeUrl = escapeAttr(url);
-            return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer"><img src="${safeUrl}" class="msg-image" alt="图片" loading="lazy" onerror="this.parentElement.outerHTML='<span class=\\'msg-tag\\' style=\\'opacity:0.6;\\'>🖼️ [图片]</span>'" /></a>`;
+            const widthMatch = inner.match(/(?:^|,)width=(\d+)(?:,|$)/);
+            const heightMatch = inner.match(/(?:^|,)height=(\d+)(?:,|$)/);
+            const width = widthMatch ? parseInt(widthMatch[1], 10) : 0;
+            const height = heightMatch ? parseInt(heightMatch[1], 10) : 0;
+            const sizeStyle = getImageDisplayStyle(width, height);
+            return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer"><img src="${safeUrl}" class="msg-image" alt="图片" loading="lazy"${sizeStyle} onload="this.classList.add('loaded')" onerror="this.parentElement.outerHTML='<span class=\\'msg-tag\\' style=\\'opacity:0.6;\\'>🖼️ [图片]</span>'" /></a>`;
         }
         return `<span class="msg-tag">🖼️ [图片]</span>`;
     });
 
     // QQ Faces
     escaped = escaped.replace(/\[CQ:face,id=(\d+)[^\]]*\]/g, (match, id) => {
-        return `<img src="https://gxh.vip.qq.com/sys/hycdn/sng/face/s/${id}.png" class="msg-face" alt="表情" loading="lazy" onerror="this.style.display='none'" />`;
+        return `<img src="https://gxh.vip.qq.com/sys/hycdn/sng/face/s/${id}.png" class="msg-face" alt="表情" loading="lazy" onload="this.style.background='none'" onerror="this.style.display='none'" />`;
     });
     escaped = escaped.replace(/\[CQ:face,[^\]]*\]/g, '<span class="msg-tag">😊 表情</span>');
 
@@ -253,6 +363,14 @@ function formatMsg(text) {
     return escaped;
 }
 
+function settleLoadedImages(container) {
+    container.querySelectorAll('img.msg-image').forEach(img => {
+        if (img.complete && img.naturalWidth > 0) {
+            img.classList.add('loaded');
+        }
+    });
+}
+
 window.scrollToMsg = (msgId) => {
     const safeMsgId = CSS.escape(msgId);
     const el = document.querySelector(`.msg-bubble[data-msg-id="${safeMsgId}"]`);
@@ -302,6 +420,37 @@ function getAvatarUrl(userId) {
     return `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2364748b'%3E%3Cpath d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z'/%3E%3C/svg%3E`;
 }
 
+function preloadAvatar(userId) {
+    const key = safeText(userId);
+    if (avatarPreloadCache.has(key)) return avatarPreloadCache.get(key);
+
+    const url = getAvatarUrl(key);
+    const promise = new Promise(resolve => {
+        const img = new Image();
+        let settled = false;
+        const done = (src) => {
+            if (settled) return;
+            settled = true;
+            avatarResolvedCache.set(key, src);
+            resolve(src);
+        };
+        img.onload = () => {
+            if (img.decode) img.decode().then(() => done(url)).catch(() => done(url));
+            else done(url);
+        };
+        img.onerror = () => done(getAvatarUrl('fallback'));
+        img.src = url;
+        setTimeout(() => done(url), 800);
+    });
+    avatarPreloadCache.set(key, promise);
+    return promise;
+}
+
+async function preloadUserAvatars(users, limit = 12) {
+    const pending = users.slice(0, limit).map(u => preloadAvatar(u.user_id));
+    await Promise.allSettled(pending);
+}
+
 function showSkeleton(containerId, count = 5) {
     const container = document.getElementById(containerId);
     container.querySelectorAll('.message-group, .skeleton-group, .date-divider, .empty-state').forEach(el => el.remove());
@@ -331,6 +480,10 @@ function createMessageBubble(msg) {
     const text = document.createElement('div');
     text.className = 'msg-text';
     text.innerHTML = formatMsg(msg.message);
+    settleLoadedImages(text);
+    if (text.querySelector('.msg-image, .msg-video')) {
+        bubble.classList.add('msg-bubble-media');
+    }
 
     const footer = document.createElement('div');
     footer.className = 'msg-footer';
@@ -411,16 +564,13 @@ async function fetchSessions() {
                 const content = document.createElement('div');
                 content.className = 'category-content';
 
-                header.onclick = () => {
-                    header.classList.toggle('collapsed');
-                    content.classList.toggle('hidden');
-                };
+                header.onclick = () => toggleCategory(header, content);
 
                 groupData.items.forEach((s, idx) => {
                     const item = document.createElement('div');
-                    item.className = `session-item animate-fade ${activeSessionId === s.session_id ? 'active' : ''}`;
+                    item.className = `session-item session-enter ${activeSessionId === s.session_id ? 'active' : ''}`;
                     item.dataset.sessionId = s.session_id;
-                    item.style.animationDelay = `${idx * 0.04}s`;
+                    item.style.animationDelay = `${Math.min(idx, 8) * 0.025}s`;
                     item.onclick = (e) => {
                         e.stopPropagation();
                         selectSession(s.session_id, s.name, s.message_type);
@@ -438,10 +588,11 @@ async function fetchSessions() {
                                 <span>${escapeAttr(lastDate)}</span>
                             </div>
                             <div class="session-name"></div>
-                            <div class="session-last">${formatMsg(s.last_msg)}</div>
+                            <div class="session-last"></div>
                         </div>
                     `;
                     item.querySelector('.session-name').textContent = safeText(s.name);
+                    item.querySelector('.session-last').textContent = formatSessionPreview(s.last_msg);
                     content.appendChild(item);
                 });
 
@@ -459,11 +610,31 @@ async function fetchSessions() {
 }
 
 async function selectSession(sessionId, name, msgType) {
+    if (activeSessionId === sessionId && activeUserId === '') {
+        if (window.innerWidth <= 1400) {
+            closeAllPanels();
+        }
+        document.querySelector(`.session-item[data-session-id="${CSS.escape(sessionId)}"]`)?.classList.add('active');
+        return;
+    }
+
     if (window.innerWidth <= 1400) {
         closeAllPanels();
     }
     activeMsgType = msgType || '';
     activeSessionId = sessionId;
+    memberRequestSeq += 1;
+    rankRequestSeq += 1;
+    memberOffset = 0;
+    memberTotal = 0;
+    memberHasMore = false;
+    rankOffset = 0;
+    rankTotal = 0;
+    rankHasMore = false;
+    sidebarMemberUsers = [];
+    rankMemberUsers = [];
+    window.globalTopUsers = [];
+    memberSearchKeyword = '';
     document.getElementById('activeSessionId').innerText = sessionId;
 
     document.querySelectorAll('.session-item').forEach(el => {
@@ -487,12 +658,11 @@ async function selectSession(sessionId, name, msgType) {
         searchInput.id = 'memberSearch';
         searchInput.placeholder = '定位成员...';
         searchInput.addEventListener('click', (event) => event.stopPropagation());
+        searchInput.oninput = (e) => debounceMemberSearch(e.target.value);
         searchBox.appendChild(searchInput);
 
         const userListContainer = document.createElement('div');
         userListContainer.id = 'userListContainer';
-
-        searchInput.oninput = (e) => renderUserList(e.target.value);
 
         subMenu.appendChild(searchBox);
         subMenu.appendChild(userListContainer);
@@ -504,24 +674,24 @@ async function selectSession(sessionId, name, msgType) {
     fetchHistory();
 }
 
-function renderUserList(filter = '') {
+function renderUserList(users = sidebarMemberUsers) {
     const container = document.getElementById('userListContainer');
     if (!container) return;
-    container.innerHTML = '';
-    const filtered = window.globalTopUsers.filter(u => {
-        window.userMap[u.user_id] = u.sender_name;
-        return u.sender_name.toLowerCase().includes(filter.toLowerCase()) ||
-            u.user_id.toString().includes(filter);
-    });
+    const subMenu = container.closest('.sidebar-sub-menu');
+    const fragment = document.createDocumentFragment();
 
-    filtered.forEach(u => {
+    users.forEach(u => {
+        window.userMap[u.user_id] = u.sender_name;
         const subItem = document.createElement('div');
         subItem.className = `sub-menu-item ${activeUserId === u.user_id ? 'active' : ''}`;
         const wrap = document.createElement('span');
         wrap.style.cssText = 'display:flex; align-items:center; gap:0.4rem; overflow:hidden;';
         const avatar = document.createElement('img');
-        avatar.src = getAvatarUrl(safeText(u.user_id));
+        const avatarKey = safeText(u.user_id);
+        avatar.src = avatarResolvedCache.get(avatarKey) || getAvatarUrl(avatarKey);
         avatar.onerror = () => { avatar.src = getAvatarUrl('fallback'); };
+        avatar.loading = 'lazy';
+        avatar.decoding = 'async';
         avatar.style.cssText = 'width:20px; height:20px; border-radius:50%; flex-shrink:0; object-fit:cover;';
         const name = document.createElement('span');
         name.className = 'sub-name';
@@ -535,6 +705,7 @@ function renderUserList(filter = '') {
         subItem.append(wrap, count);
         subItem.onclick = (e) => {
             e.stopPropagation();
+            const previousUserId = activeUserId;
             if (activeUserId === u.user_id) {
                 activeUserId = '';
                 document.querySelectorAll('.sub-menu-item').forEach(el => el.classList.remove('active'));
@@ -546,11 +717,198 @@ function renderUserList(filter = '') {
             if (window.innerWidth <= 1400) {
                 closeAllPanels();
             }
+            if (previousUserId === activeUserId) return;
             reloadStats();
             fetchHistory();
         };
-        container.appendChild(subItem);
+        fragment.appendChild(subItem);
     });
+
+    if (memberHasMore) {
+        const more = document.createElement('button');
+        more.type = 'button';
+        more.className = 'member-load-more';
+        more.textContent = `加载更多 (${Math.min(memberOffset + memberPageSize, memberTotal)}/${memberTotal})`;
+        more.onclick = (event) => {
+            event.stopPropagation();
+            fetchMembers({ target: 'sidebar', keyword: memberSearchKeyword, offset: memberOffset, append: true });
+        };
+        fragment.appendChild(more);
+    }
+
+    container.replaceChildren(fragment);
+    openSidebarSubMenu(subMenu);
+}
+
+async function fetchMembers({ target = 'both', keyword = '', offset = 0, append = false, limit = null } = {}) {
+    if (!activeSessionId || activeMsgType === 'friend') return;
+    const updateSidebar = target === 'sidebar' || target === 'both';
+    const updateRank = target === 'rank' || target === 'both';
+    const sidebarSeq = updateSidebar ? ++memberRequestSeq : memberRequestSeq;
+    const rankSeq = updateRank ? ++rankRequestSeq : rankRequestSeq;
+    const requestKeyword = updateRank && !updateSidebar ? '' : safeText(keyword).trim();
+    const defaultLimit = !append && offset === 0 ? getInitialMemberLimit() : memberPageSize;
+    const fetchLimit = Math.max(1, Math.min(100, safeCount(limit) || defaultLimit));
+    let url = `/api/members?session_id=${encodeURIComponent(activeSessionId)}&limit=${fetchLimit}&offset=${offset}`;
+    if (requestKeyword) url += `&keyword=${encodeURIComponent(requestKeyword)}`;
+    if (filterStart) url += `&time_start=${filterStart}`;
+    if (filterEnd) url += `&time_end=${filterEnd}`;
+
+    try {
+        const res = await fetchAPI(url);
+        if (!res.success) return;
+        const payload = res.data || {};
+        const members = payload.members || [];
+        preloadUserAvatars(members);
+
+        if (updateSidebar && sidebarSeq === memberRequestSeq) {
+            sidebarMemberUsers = append ? sidebarMemberUsers.concat(members) : members;
+            window.globalTopUsers = sidebarMemberUsers;
+            memberOffset = offset + members.length;
+            memberTotal = safeCount(payload.total);
+            memberHasMore = !!payload.has_more;
+            renderUserList(sidebarMemberUsers);
+        }
+
+        if (updateRank && rankSeq === rankRequestSeq) {
+            if (!append) memberAutoFillCount = 0;
+            rankMemberUsers = append ? rankMemberUsers.concat(members) : members;
+            rankOffset = offset + members.length;
+            rankTotal = safeCount(payload.total);
+            rankHasMore = !!payload.has_more;
+            renderAnalysisMemberList(rankMemberUsers, rankHasMore, rankTotal);
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+
+function refreshMembersForActiveSession() {
+    const limit = getInitialMemberLimit();
+    if (memberSearchKeyword) {
+        fetchMembers({ target: 'rank', keyword: '', offset: 0, append: false, limit });
+        fetchMembers({ target: 'sidebar', keyword: memberSearchKeyword, offset: 0, append: false, limit: memberPageSize });
+    } else {
+        fetchMembers({ target: 'both', keyword: '', offset: 0, append: false, limit });
+    }
+}
+
+function scheduleAnalysisMemberAutofill() {
+    if (memberAutoFillPending || memberAutoFillCount >= memberAutoFillMaxRequests) return;
+    memberAutoFillPending = true;
+    requestAnimationFrame(() => {
+        memberAutoFillPending = false;
+        autofillAnalysisMembers();
+    });
+}
+
+function autofillAnalysisMembers() {
+    if (!rankHasMore || activeUserId || activeMsgType === 'friend') return;
+
+    const content = document.getElementById('analysisContent');
+    const list = document.getElementById('rankList');
+    const more = document.getElementById('rankLoadMore');
+    const firstItem = list?.querySelector('.rank-item');
+    if (!content || !list || !firstItem) return;
+
+    const contentRect = content.getBoundingClientRect();
+    const lastVisible = more && more.style.display !== 'none' ? more : list;
+    const lastRect = lastVisible.getBoundingClientRect();
+    const contentStyle = window.getComputedStyle(content);
+    const bottomPadding = parseFloat(contentStyle.paddingBottom) || 0;
+    const remainingSpace = contentRect.bottom - lastRect.bottom - bottomPadding;
+    if (remainingSpace <= 12) return;
+
+    const listStyle = window.getComputedStyle(list);
+    const gap = parseFloat(listStyle.rowGap || listStyle.gap) || 0;
+    const rowHeight = Math.max(1, firstItem.getBoundingClientRect().height + gap);
+    const needed = Math.min(memberPageSize, Math.max(1, Math.ceil((remainingSpace + gap) / rowHeight)));
+
+    memberAutoFillCount += 1;
+    fetchMembers({
+        target: 'rank',
+        keyword: '',
+        offset: rankOffset,
+        append: true,
+        limit: needed,
+    });
+}
+
+function openSidebarSubMenu(subMenu) {
+    if (!subMenu) return;
+    const targetHeight = Math.min(subMenu.scrollHeight, 300);
+    subMenu.style.setProperty('--submenu-height', `${targetHeight}px`);
+
+    if (!subMenu.classList.contains('open')) {
+        requestAnimationFrame(() => {
+            subMenu.classList.add('open');
+            const finishOpen = (event) => {
+                if (event.target !== subMenu || event.propertyName !== 'max-height') return;
+                subMenu.classList.toggle('scrollable', subMenu.scrollHeight > 300);
+                subMenu.removeEventListener('transitionend', finishOpen);
+            };
+            subMenu.addEventListener('transitionend', finishOpen);
+        });
+    } else {
+        subMenu.classList.toggle('scrollable', subMenu.scrollHeight > 300);
+    }
+}
+
+function attachRankItemHandlers(root = document) {
+    root.querySelectorAll('.rank-item').forEach(item => {
+        item.addEventListener('click', () => {
+            const nextUserId = item.getAttribute('data-user-id');
+            if (!nextUserId) return;
+            activeUserId = nextUserId;
+            const uname = item.dataset.userName || '';
+
+            document.querySelectorAll('.sub-menu-item').forEach(el => {
+                if (el.innerText.includes(uname)) el.classList.add('active');
+                else el.classList.remove('active');
+            });
+            reloadStats();
+            fetchHistory();
+        });
+    });
+}
+
+function renderMemberRankItems(users) {
+    return users.map((u, idx) => {
+        const rank = idx + 1;
+        const div = document.createElement('div');
+        div.innerText = u.sender_name;
+        const safeName = div.innerHTML;
+
+        let rankDisp = rank;
+        if (rank === 1) rankDisp = '🥇';
+        else if (rank === 2) rankDisp = '🥈';
+        else if (rank === 3) rankDisp = '🥉';
+
+        return `
+            <div class="rank-item" data-rank="${rank}" data-user-id="${escapeAttr(u.user_id)}" data-user-name="${escapeAttr(u.sender_name)}">
+                <div class="rank-number">${rankDisp}</div>
+                <img src="${getAvatarUrl(u.user_id)}" class="rank-avatar" loading="lazy" decoding="async" onerror="this.src=getAvatarUrl('fallback')" />
+                <div class="rank-info">
+                    <div class="rank-name">${safeName}</div>
+                    <div class="rank-count">${safeCount(u.count).toLocaleString()} 条消息</div>
+                </div>
+            </div>
+        `;
+    }).join('');
+}
+
+function renderAnalysisMemberList(users, hasMore, total) {
+    const list = document.getElementById('rankList');
+    const more = document.getElementById('rankLoadMore');
+    if (!list) return;
+    list.innerHTML = renderMemberRankItems(users);
+    attachRankItemHandlers(list);
+    if (more) {
+        more.style.display = hasMore ? 'block' : 'none';
+        more.textContent = `加载更多 (${Math.min(rankOffset + memberPageSize, total)}/${total})`;
+        more.onclick = () => fetchMembers({ target: 'rank', keyword: '', offset: rankOffset, append: true });
+    }
+    scheduleAnalysisMemberAutofill();
 }
 
 async function reloadStats() {
@@ -566,8 +924,7 @@ async function reloadStats() {
         if (res.success) {
             updateAnalysisPanel(res.data);
             if (!activeUserId && res.data.top_users) {
-                window.globalTopUsers = res.data.top_users;
-                renderUserList(document.getElementById('memberSearch') ? document.getElementById('memberSearch').value : '');
+                refreshMembersForActiveSession();
             }
         } else {
             updateAnalysisPanel(null);
@@ -685,7 +1042,7 @@ function updateAnalysisPanel(data) {
         data.message_types.forEach(t => {
             if (safeCount(t.value) > 0) {
                 html += `
-                    <div class="type-item animate-fade">
+                    <div class="type-item">
                         <div class="type-name"><span>${escapeAttr(t.name)}</span></div>
                         <div class="type-value">${safeCount(t.value).toLocaleString()}</div>
                     </div>
@@ -694,50 +1051,19 @@ function updateAnalysisPanel(data) {
         });
         html += `</div></div>`;
     } else if (data.top_users && data.top_users.length > 0) {
-        html += `<div style="margin-top: 0.5rem;"><div class="section-title">🏆 活跃成员排行</div><div class="rank-list">`;
-        const top15 = data.top_users.slice(0, 15);
-        top15.forEach((u, idx) => {
-            const rank = idx + 1;
-            const div = document.createElement('div');
-            div.innerText = u.sender_name;
-            const safeName = div.innerHTML;
-
-            let rankDisp = rank;
-            if (rank === 1) rankDisp = '🥇';
-            else if (rank === 2) rankDisp = '🥈';
-            else if (rank === 3) rankDisp = '🥉';
-
-            html += `
-                <div class="rank-item animate-fade" data-rank="${rank}" data-user-id="${escapeAttr(u.user_id)}" data-user-name="${escapeAttr(u.sender_name)}" style="animation-delay: ${idx * 0.04}s;">
-                    <div class="rank-number">${rankDisp}</div>
-                    <img src="${getAvatarUrl(u.user_id)}" class="rank-avatar" onerror="this.src=getAvatarUrl('fallback')" />
-                    <div class="rank-info">
-                        <div class="rank-name">${safeName}</div>
-                        <div class="rank-count">${safeCount(u.count).toLocaleString()} 条消息</div>
-                    </div>
-                </div>
-            `;
-        });
-        html += `</div></div>`;
+        html += `
+            <div style="margin-top: 0.5rem;">
+                <div class="section-title">🏆 活跃成员排行</div>
+                <div class="rank-list" id="rankList">${renderMemberRankItems(data.top_users.slice(0, getInitialMemberLimit()))}</div>
+                <button type="button" class="member-load-more" id="rankLoadMore" style="display:none;">加载更多</button>
+            </div>
+        `;
     }
 
     content.innerHTML = html;
 
     if (!isIndividual && data.top_users && data.top_users.length > 0) {
-        document.querySelectorAll('#analysisContent .rank-item').forEach(item => {
-            item.addEventListener('click', () => {
-                activeUserId = item.getAttribute('data-user-id');
-                const uname = item.dataset.userName || '';
-
-                document.querySelectorAll('.sub-menu-item').forEach(el => {
-                    if (el.innerText.includes(uname)) el.classList.add('active');
-                    else el.classList.remove('active');
-                });
-                reloadStats();
-                currentPage = 1;
-                fetchHistory();
-            });
-        });
+        attachRankItemHandlers();
     }
 }
 
@@ -750,6 +1076,36 @@ function scrollListToBottom(el) {
     } else {
         el.scrollTop = el.scrollHeight;
     }
+}
+
+function disablePrependAnimations(fragment) {
+    fragment.querySelectorAll('.animate-fade').forEach(el => {
+        el.classList.remove('animate-fade');
+        el.style.animationDelay = '';
+    });
+}
+
+function restorePrependAnchor(list, anchorEl, anchorTop) {
+    if (!anchorEl || !anchorEl.isConnected || anchorTop === null) return;
+    list.scrollTop += anchorEl.getBoundingClientRect().top - anchorTop;
+}
+
+function getPrependAnchor(list) {
+    const listTop = list.getBoundingClientRect().top;
+    const candidates = list.querySelectorAll('.message-group, .msg-system-center, .empty-state');
+    for (const el of candidates) {
+        const rect = el.getBoundingClientRect();
+        if (rect.bottom > listTop + 8) {
+            return el;
+        }
+    }
+    return null;
+}
+
+function stabilizePrependAnchor(list, anchorEl, anchorTop, attempts = 5) {
+    restorePrependAnchor(list, anchorEl, anchorTop);
+    if (attempts <= 1) return;
+    requestAnimationFrame(() => stabilizePrependAnchor(list, anchorEl, anchorTop, attempts - 1));
 }
 
 // 监听容器高度变化（如图片加载），自动保持底部
@@ -766,12 +1122,15 @@ const listObserver = new ResizeObserver(entries => {
 
 async function fetchHistory(append = false) {
     if (!activeSessionId) return;
+    if (isHistoryLoading) return;
+    isHistoryLoading = true;
 
     const list = document.getElementById('messageList');
+    const loadMoreBtn = document.getElementById('loadMoreBtn');
+    if (append && loadMoreBtn) loadMoreBtn.disabled = true;
     if (!append) {
         currentPage = 1;
         nextCursor = 0;
-        showSkeleton('messageList', 8);
         // 开始监听高度变化
         listObserver.observe(list);
     }
@@ -865,13 +1224,12 @@ async function fetchHistory(append = false) {
                 }
             });
 
-            if (data.has_more === false || data.data.length < limit) loadMoreEl.style.display = 'none';
-            else loadMoreEl.style.display = 'block';
+            const hasMore = !(data.has_more === false || data.data.length < limit);
 
             if (append) {
-                // To maintain scroll stability when prepending:
-                const oldScrollTop = list.scrollTop;
-                const oldScrollHeight = list.scrollHeight;
+                const anchorEl = getPrependAnchor(list);
+                const anchorTop = anchorEl ? anchorEl.getBoundingClientRect().top : null;
+                disablePrependAnimations(fragment);
 
                 // insert after loadMoreWrap
                 if (loadMoreEl.nextSibling) {
@@ -879,9 +1237,10 @@ async function fetchHistory(append = false) {
                 } else {
                     list.appendChild(fragment);
                 }
-                // restore position
-                list.scrollTop = oldScrollTop + (list.scrollHeight - oldScrollHeight);
+                loadMoreEl.style.display = hasMore ? 'block' : 'none';
+                stabilizePrependAnchor(list, anchorEl, anchorTop);
             } else {
+                loadMoreEl.style.display = hasMore ? 'block' : 'none';
                 list.appendChild(fragment);
 
                 // 确保底部有一个永久锚点
@@ -901,6 +1260,10 @@ async function fetchHistory(append = false) {
             }
         }
     } catch (e) { console.error(e); }
+    finally {
+        isHistoryLoading = false;
+        if (loadMoreBtn) loadMoreBtn.disabled = false;
+    }
 }
 
 async function fetchStats() {
@@ -949,10 +1312,28 @@ async function initApp() {
     }
 }
 
-document.getElementById('loadMoreBtn').onclick = () => {
+const loadMoreBtn = document.getElementById('loadMoreBtn');
+function handleLoadMore() {
+    if (isHistoryLoading) return;
+    document.activeElement?.blur();
+    closeAllPanels();
     currentPage++;
     fetchHistory(true);
-};
+}
+
+loadMoreBtn.addEventListener('pointerdown', (event) => {
+    event.preventDefault();
+});
+loadMoreBtn.addEventListener('mousedown', (event) => {
+    event.preventDefault();
+});
+loadMoreBtn.addEventListener('pointerup', (event) => {
+    if (event.pointerType !== 'mouse') {
+        event.preventDefault();
+        handleLoadMore();
+    }
+});
+loadMoreBtn.onclick = handleLoadMore;
 
 // Time Filters Logic
 document.querySelectorAll('.time-btn').forEach(btn => {

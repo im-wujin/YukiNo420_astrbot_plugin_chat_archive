@@ -367,7 +367,7 @@ class ArchiveGetContextMessagesTool(FunctionTool[AstrAgentContext]):
         )
 
 
-@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "1.1.6")
+@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "1.2")
 class ChatArchivePlugin(Star):
     # Batch writer configuration
     _BATCH_SIZE = 50
@@ -752,7 +752,10 @@ class ChatArchivePlugin(Star):
                 elif cls_name == "Image":
                     url = getattr(comp, "url", "") or getattr(comp, "file", "")
                     if url:
-                        parts.append(f"[CQ:image,url={url}]")
+                        width = ChatArchivePlugin._positive_int(getattr(comp, "width", 0))
+                        height = ChatArchivePlugin._positive_int(getattr(comp, "height", 0))
+                        dim_str = f",width={width},height={height}" if width and height else ""
+                        parts.append(f"[CQ:image,url={url}{dim_str}]")
                     else:
                         parts.append("[CQ:image]")
                 elif cls_name == "Video":
@@ -790,6 +793,100 @@ class ChatArchivePlugin(Star):
             except Exception as e:
                 logger.debug(f"Chat Archive: failed to serialize {cls_name}: {e}")
         return "".join(parts)
+
+    @staticmethod
+    def _positive_int(value) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return number if number > 0 else 0
+
+    @staticmethod
+    def _valid_image_dimensions(width: int, height: int) -> bool:
+        return 0 < width <= 100000 and 0 < height <= 100000
+
+    @staticmethod
+    def _read_image_dimensions(filepath: str) -> tuple[int, int] | None:
+        """Read PNG/JPEG/GIF/WebP dimensions from headers without external deps."""
+        import struct
+
+        try:
+            with open(filepath, "rb") as f:
+                header = f.read(30)
+                if len(header) < 10:
+                    return None
+
+                if header[:8] == b"\x89PNG\r\n\x1a\n" and len(header) >= 24:
+                    width, height = struct.unpack(">II", header[16:24])
+                    return (width, height) if ChatArchivePlugin._valid_image_dimensions(width, height) else None
+
+                if header[:3] == b"GIF":
+                    width, height = struct.unpack("<HH", header[6:10])
+                    return (width, height) if ChatArchivePlugin._valid_image_dimensions(width, height) else None
+
+                if header[:2] == b"\xff\xd8":
+                    f.seek(2)
+                    sof_markers = set(range(0xC0, 0xC4)) | set(range(0xC5, 0xC8)) | set(range(0xC9, 0xCC)) | set(range(0xCD, 0xD0))
+                    while True:
+                        marker_prefix = f.read(1)
+                        if not marker_prefix:
+                            break
+                        if marker_prefix != b"\xff":
+                            continue
+                        marker_byte = f.read(1)
+                        if not marker_byte:
+                            break
+                        marker = marker_byte[0]
+                        while marker == 0xFF:
+                            marker_byte = f.read(1)
+                            if not marker_byte:
+                                return None
+                            marker = marker_byte[0]
+                        if marker == 0xD9:
+                            break
+                        if 0xD0 <= marker <= 0xD7 or marker == 0x01:
+                            continue
+                        length_bytes = f.read(2)
+                        if len(length_bytes) < 2:
+                            break
+                        length = struct.unpack(">H", length_bytes)[0]
+                        if length < 2:
+                            break
+                        if marker in sof_markers:
+                            data = f.read(5)
+                            if len(data) < 5:
+                                break
+                            height, width = struct.unpack(">HH", data[1:5])
+                            return (width, height) if ChatArchivePlugin._valid_image_dimensions(width, height) else None
+                        f.seek(length - 2, 1)
+                    return None
+
+                if header[:4] == b"RIFF" and header[8:12] == b"WEBP":
+                    chunk = header[12:16]
+                    if chunk == b"VP8 " and len(header) >= 30:
+                        width = struct.unpack("<H", header[26:28])[0] & 0x3FFF
+                        height = struct.unpack("<H", header[28:30])[0] & 0x3FFF
+                        return (width, height) if ChatArchivePlugin._valid_image_dimensions(width, height) else None
+                    if chunk == b"VP8L" and len(header) >= 25:
+                        bits = struct.unpack("<I", header[21:25])[0]
+                        width = (bits & 0x3FFF) + 1
+                        height = ((bits >> 14) & 0x3FFF) + 1
+                        return (width, height) if ChatArchivePlugin._valid_image_dimensions(width, height) else None
+                    if chunk == b"VP8X":
+                        f.seek(24)
+                        canvas = f.read(6)
+                        if len(canvas) == 6:
+                            width = (canvas[0] | (canvas[1] << 8) | (canvas[2] << 16)) + 1
+                            height = (canvas[3] | (canvas[4] << 8) | (canvas[5] << 16)) + 1
+                            return (width, height) if ChatArchivePlugin._valid_image_dimensions(width, height) else None
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _cq_param_exists(inner: str, key: str) -> bool:
+        return re.search(rf"(?:^|,){re.escape(key)}=", inner) is not None
 
     @staticmethod
     @contextmanager
@@ -1021,6 +1118,16 @@ class ChatArchivePlugin(Star):
             cached_url = await self._download_media_to_cache(url)
             # Replace the original url with cached url in the CQ code
             new_inner = inner.replace(original_url, cached_url)
+            if (
+                cq_type == "image"
+                and not self._cq_param_exists(new_inner, "width")
+                and not self._cq_param_exists(new_inner, "height")
+                and cached_url.startswith("/static/cache/")
+            ):
+                cached_path = STATIC_CACHE_DIR / cached_url.rsplit("/", 1)[-1]
+                dims = self._read_image_dimensions(str(cached_path))
+                if dims:
+                    new_inner += f",width={dims[0]},height={dims[1]}"
             return f"[CQ:{cq_type},{new_inner}]"
         return match.group(0)
 

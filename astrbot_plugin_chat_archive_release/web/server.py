@@ -609,9 +609,32 @@ def get_stats(
 
         # Top users
         top_sql = f"""
-            SELECT user_id, sender_name, COUNT(*) as cnt
-            FROM chat_history {where_cl}
-            GROUP BY user_id ORDER BY cnt DESC LIMIT 15
+            WITH filtered AS (
+                SELECT id, user_id, sender_name, timestamp
+                FROM chat_history {where_cl}
+                AND user_id IS NOT NULL AND user_id != ''
+            )
+            SELECT grouped.user_id,
+                   COALESCE(
+                       (
+                           SELECT f.sender_name
+                           FROM filtered f
+                           WHERE f.user_id = grouped.user_id
+                           AND f.sender_name IS NOT NULL
+                           AND f.sender_name != ''
+                           ORDER BY f.timestamp DESC, f.id DESC
+                           LIMIT 1
+                       ),
+                       grouped.user_id
+                   ) as sender_name,
+                   grouped.cnt
+            FROM (
+                SELECT user_id, COUNT(*) as cnt
+                FROM filtered
+                GROUP BY user_id
+            ) grouped
+            ORDER BY grouped.cnt DESC, grouped.user_id ASC
+            LIMIT 30
         """
         top_rows = db.execute(top_sql, params).fetchall()
         top_users = []
@@ -668,6 +691,105 @@ def get_stats(
     finally:
         if db:
             db.close()
+
+@app.get("/api/members")
+def get_members(
+    session_id: str = Query("", max_length=256),
+    keyword: str = Query("", max_length=100),
+    time_start: int = Query(0, ge=0),
+    time_end: int = Query(0, ge=0),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+):
+    db = None
+    try:
+        db = get_db_connection()
+
+        conditions = ["user_id IS NOT NULL", "user_id != ''"]
+        params = []
+        if session_id == "legacy:archive":
+            conditions.append(
+                "(session_id IS NULL OR session_id = '' OR session_id = 'legacy:archive')"
+            )
+        elif session_id:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        if time_start:
+            conditions.append("timestamp >= ?")
+            params.append(time_start)
+        if time_end:
+            conditions.append("timestamp <= ?")
+            params.append(time_end)
+        if keyword:
+            safe_keyword = (
+                keyword.replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_")
+            )
+            conditions.append("(sender_name LIKE ? ESCAPE '\\' OR user_id LIKE ? ESCAPE '\\')")
+            params.extend([f"%{safe_keyword}%", f"%{safe_keyword}%"])
+
+        where_cl = " WHERE " + " AND ".join(conditions)
+
+        count_sql = f"""
+            SELECT COUNT(*) as total FROM (
+                SELECT user_id FROM chat_history {where_cl} GROUP BY user_id
+            )
+        """
+        total = db.execute(count_sql, params).fetchone()["total"]
+
+        members_sql = f"""
+            WITH filtered AS (
+                SELECT id, user_id, sender_name, timestamp
+                FROM chat_history {where_cl}
+            )
+            SELECT grouped.user_id,
+                   COALESCE(
+                       (
+                           SELECT f.sender_name
+                           FROM filtered f
+                           WHERE f.user_id = grouped.user_id
+                           AND f.sender_name IS NOT NULL
+                           AND f.sender_name != ''
+                           ORDER BY f.timestamp DESC, f.id DESC
+                           LIMIT 1
+                       ),
+                       grouped.user_id
+                   ) as sender_name,
+                   grouped.cnt
+            FROM (
+                SELECT user_id, COUNT(*) as cnt
+                FROM filtered
+                GROUP BY user_id
+            ) grouped
+            ORDER BY grouped.cnt DESC, grouped.user_id ASC
+            LIMIT ? OFFSET ?
+        """
+        rows = db.execute(members_sql, [*params, limit, offset]).fetchall()
+        members = [
+            {"user_id": r["user_id"], "sender_name": r["sender_name"], "count": r["cnt"]}
+            for r in rows
+        ]
+
+        return JSONResponse(
+            content={
+                "success": True,
+                "data": {
+                    "members": members,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                    "has_more": offset + len(members) < total,
+                },
+            }
+        )
+    except Exception as e:
+        logger.error(f"WebUI get_members error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if db:
+            db.close()
+
 def _load_custom_apis():
     try:
         import importlib.util
