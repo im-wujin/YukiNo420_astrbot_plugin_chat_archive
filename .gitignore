@@ -9,6 +9,8 @@ venv/
 
 # Runtime data (database, cache and generated files)
 data/
+web_cache/
+chat_archive_failed_writes.jsonl
 
 # WebUI Local Media Cache
 web/static/cache/
