@@ -7,11 +7,8 @@ __pycache__/
 .venv/
 venv/
 
-# SQLite Database (Plugin Database & Temp Files)
-data/*.db
-data/*.db-journal
-data/*.db-wal
-data/*.db-shm
+# Runtime data (database, cache and generated files)
+data/
 
 # WebUI Local Media Cache
 web/static/cache/
