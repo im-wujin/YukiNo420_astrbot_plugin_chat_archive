@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="referrer" content="no-referrer">
+    <title>Chat Archive | 对话管理</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/main.css">
+    <link rel="icon" href="/static/logo.png" type="image/png">
+</head>
+
+<body>
+    <!-- Mobile Overlay -->
+    <div id="mobile-overlay" class="mobile-overlay"></div>
+
+    <div id="auth-overlay">
+        <div class="auth-card animate-fade">
+            <h2 style="margin-bottom: 0.5rem; font-weight: 800;">访问控制</h2>
+            <p style="color: var(--text-muted); margin-bottom: 2.5rem; font-size: 0.9rem;">Chat Archive Admin Panel</p>
+            <input type="password" id="api-key-input" placeholder="输入 API Key">
+            <button class="primary-btn" style="width: 100%;" onclick="verifyLogin()">验证并进入</button>
+            <p id="auth-error"
+                style="color: var(--danger); margin-top: 1.25rem; font-size: 0.8rem; display: none; font-weight: 600;">
+                Key 校验失败</p>
+        </div>
+    </div>
+
+    <!-- Sidebar -->
+    <div class="sidebar">
+        <div class="sidebar-header">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px;">
+            <div style="display: flex; align-items: center; gap: 12px;">
+                <img src="/static/logo.png"
+                    style="width: 32px; height: 32px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);"
+                    alt="Logo">
+                <h1 style="margin: 0; font-size: 1.15rem; font-weight: 700; display: flex; align-items: center; gap: 0.75rem;"><span class="status-dot"></span>Chat Archive</h1>
+            </div>
+            <div id="btn-close-sidebar" class="close-sidebar-btn" style="display:none; color: white; padding: 5px; cursor: pointer; font-size: 1.5rem;">×</div>
+            </div>
+            <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.75rem; font-weight: 500;">
+                <span id="stat-total" style="color: var(--text-main); font-weight: 700;">0</span> 消息已存档 | <span
+                    id="stat-today" style="color: var(--text-main); font-weight: 700;">0</span> 今日
+            </div>
+        </div>
+        <div class="session-list" id="sessionList">
+            <!-- Sessions injected here -->
+        </div>
+        <div style="padding: 1.25rem; border-top: 1px solid var(--glass-border); background: rgba(15, 23, 42, 0.4);">
+            <button class="primary-btn" onclick="logout()"
+                style="background: rgba(255,255,255,0.05); font-size: 0.75rem; width: 100%; border: 1px solid var(--glass-border);">退出登录</button>
+        </div>
+    </div>
+
+    <!-- Main -->
+    <div class="main-container">
+        <header class="content-header">
+            
+            <div id="activeSessionId" style="font-size: 0.8rem; color: var(--text-muted); padding: 0.15rem 0 0.3rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: center;">尚未选择</div>
+            <div style="display: flex; align-items: center; justify-content: center; gap: 0.5rem;">
+                <div class="mobile-controls" style="display: none; flex-shrink: 0;">
+                    <div id="btn-sidebar" class="mobile-btn">☰ 会话</div>
+                    <div id="btn-analysis" class="mobile-btn">📊 分析</div>
+                </div>
+                <div class="search-area" style="flex: 1; min-width: 0;">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                        stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.4;">
+                        <circle cx="11" cy="11" r="8"></circle>
+                        <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                    </svg>
+                    <input type="text" id="searchInput" placeholder="搜索..."
+                        onkeydown="if(event.key === 'Enter') handleSearch()">
+                </div>
+            </div>
+        </header>
+
+        <div class="message-viewport" id="messageList">
+            <div id="loadMoreWrap" style="display: none; padding: 1rem 0; text-align: center; margin-bottom: 1rem;">
+                <button class="primary-btn" id="loadMoreBtn"
+                    style="width: auto; padding: 0.4rem 2rem; background: rgba(255,255,255,0.05); border: 1px solid var(--glass-border); color: var(--text-sub); border-radius: 100px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s;">⇧
+                    加载更早的记录</button>
+            </div>
+            <div class="empty-state">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"
+                    stroke-linejoin="round">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <p style="font-weight: 600; font-size: 1.1rem; color: var(--text-sub);">点击左侧列表查看聊天记录</p>
+                <p style="font-size: 0.9rem; max-width: 250px;">归档的所有对话都将安全地存储在这里，您可以随时通过搜索找到它们。</p>
+            </div>
+        </div>
+
+        <div class="floating-actions">
+            <button class="action-btn" id="scrollToBottomBtn" title="跳转到最新消息" style="display: none;">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"
+                    stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M7 13l5 5 5-5M7 6l5 5 5-5" />
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- Analysis Panel -->
+    <div class="analysis-panel" id="analysisPanel" style="display: flex; flex-direction: column;">
+        <div class="analysis-header"
+            style="flex-direction: column; align-items: stretch; height: auto; padding: 1.25rem 1.25rem 1rem;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+                <h2 style="margin: 0; font-size: 1.1rem; font-weight: 700;">📈 数据分析</h2>
+                <div id="btn-close-analysis" class="close-analysis-btn" style="display:none; color: white; padding: 5px; cursor: pointer; font-size: 1.5rem;">×</div>
+            </div>
+
+            <div class="time-filters">
+                <button class="time-btn active" data-range="all">全部</button>
+                <button class="time-btn" data-range="today">今日</button>
+                <button class="time-btn" data-range="week">本周</button>
+                <button class="time-btn" data-range="month">本月</button>
+                <button class="time-btn" data-range="year">今年</button>
+            </div>
+            <div class="time-custom">
+                <input type="datetime-local" id="timeStart" class="time-input" title="开始时间">
+                <span style="color: var(--text-muted); font-size: 0.8rem;">-</span>
+                <input type="datetime-local" id="timeEnd" class="time-input" title="结束时间">
+            </div>
+        </div>
+        <div class="analysis-content" id="analysisContent">
+            <!-- Stats and Top Users injected here -->
+        </div>
+    </div>
+
+    <script src="/static/js/main.js"></script>
+</body>
+
+</html>

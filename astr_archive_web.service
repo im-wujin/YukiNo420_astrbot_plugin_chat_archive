@@ -1,0 +1,17 @@
+[Unit]
+Description=Chat Archive Standalone WebUI
+After=network.target
+
+[Service]
+Type=simple
+# 请将 WorkingDirectory 更改为您的实际 AstrBot plugins 目录路径
+WorkingDirectory=/path/to/AstrBot/data/plugins
+# 可选：如果未在插件主配置中指定 api_key，可以通过环境变量直接指定
+# Environment=ARCHIVE_API_KEY=your_secure_password
+# 请将路径指向您的 AstrBot 虚拟环境 Python，或者使用系统的 python3
+ExecStart=/path/to/AstrBot/.venv/bin/python3 -m astrbot_plugin_chat_archive.web.server
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

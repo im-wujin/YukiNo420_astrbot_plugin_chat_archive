@@ -1,0 +1,79 @@
+{
+    "basic": {
+        "description": "基础设置",
+        "type": "object",
+        "hint": "控制聊天记录存档的基本行为",
+        "items": {
+            "enable_archive": {
+                "type": "bool",
+                "description": "开启存档",
+                "default": true,
+                "hint": "是否实时记录聊天消息到数据库中。"
+            },
+            "ignored_users": {
+                "type": "list",
+                "description": "忽略用户",
+                "default": [],
+                "hint": "填入不希望被记录的 QQ 号（如机器人自己的 QQ）。",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "cache_media": {
+                "type": "bool",
+                "description": "缓存媒体原文件",
+                "default": false,
+                "hint": "对于图片和视频，是否下载原文件缓存到本地，避免因为 QQ 原图过期或防盗链导致无法查看。"
+            },
+            "enable_clean": {
+                "type": "bool",
+                "description": "开启定期清理",
+                "default": false,
+                "hint": "是否定期自动清理过期的图片和视频缓存文件。"
+            },
+            "clean_days": {
+                "type": "int",
+                "description": "缓存保留天数",
+                "default": 30,
+                "hint": "缓存文件保留的最大天数，超期的文件将被自动物理删除。"
+            },
+            "db_path": {
+                "type": "string",
+                "description": "数据库文件路径",
+                "default": "",
+                "hint": "自定义 SQLite 数据库文件路径。留空则使用插件目录下的默认位置 (data/chat_history.db)。修改后需要重启插件/服务以应用新路径。"
+            }
+        }
+    },
+    "web_server": {
+        "description": "WebUI 面板设置",
+        "type": "object",
+        "hint": "聊天归档独立 Web 管理面板的配置",
+        "items": {
+            "enable": {
+                "type": "bool",
+                "description": "启用内置 Web 服务",
+                "default": true,
+                "hint": "若您已在 systemd 中独立运行前端，请禁用以避免 8090 端口冲突。"
+            },
+            "host": {
+                "type": "string",
+                "description": "监听地址",
+                "default": "0.0.0.0",
+                "hint": "Web 面板监听地址，0.0.0.0 允许从外部访问。"
+            },
+            "port": {
+                "type": "int",
+                "description": "监听端口",
+                "default": 8090,
+                "hint": "Web 面板的监听端口。"
+            },
+            "api_key": {
+                "type": "string",
+                "description": "访问验证 Key",
+                "default": "",
+                "hint": "为确保安全，必须配置此访问令牌。请任意输入一段安全的字符串密码。"
+            }
+        }
+    }
+}

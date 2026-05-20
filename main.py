@@ -1,0 +1,800 @@
+import asyncio
+import datetime
+import json
+import re
+import sqlite3
+import time
+import hashlib
+from pathlib import Path
+from urllib.parse import urlparse
+import httpx
+from contextlib import contextmanager
+
+try:
+    from .db_config import get_db_connection, init_db, DatabaseManager
+except ImportError:
+    try:
+        from db_config import get_db_connection, init_db, DatabaseManager
+    except Exception:
+        raise RuntimeError("无法加载 db_config 模块，请确保插件包完整。")
+
+from astrbot.api.event import filter
+from astrbot.api.star import Context, Star, register
+from astrbot.core import AstrBotConfig
+from astrbot.core.platform.astr_message_event import AstrMessageEvent
+from astrbot.core.star.filter.event_message_type import EventMessageType
+
+# 尝试导入 web server
+try:
+    from .web.server import AdminServer
+except ImportError:
+    AdminServer = None
+
+from astrbot.api import logger
+
+try:
+    from astrbot.api.star import StarTools
+    DATA_DIR = StarTools.get_data_dir()
+except Exception:
+    # Fallback for standalone decoupling execution or tests
+    DATA_DIR = Path(__file__).resolve().parent / "data"
+
+STATIC_CACHE_DIR = DATA_DIR / "web_cache"
+
+
+@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "1.0.0")
+class ChatArchivePlugin(Star):
+    # Batch writer configuration
+    _BATCH_SIZE = 50
+    _FLUSH_INTERVAL = 2.0  # seconds
+
+    def __init__(self, context: Context, config: AstrBotConfig = None):
+        super().__init__(context)
+        self.conf = config
+
+        self._shutting_down = False
+        self._download_locks: dict[str, asyncio.Lock] = {}
+
+        # Track active background tasks to avoid garbage collection and 'Task was destroyed but it is pending' errors
+        self._background_tasks = set()
+
+        # Write buffer: queue + background writer
+        self._write_queue: asyncio.Queue = asyncio.Queue()
+        self._writer_task: asyncio.Task | None = None
+        self._writer_lock = asyncio.Lock()
+
+        # 插件启动时，显式调用建表逻辑，确保数据库表结构就绪
+        try:
+            init_db()
+            logger.info("Chat Archive: 数据库与表结构初始化成功。")
+        except Exception as e:
+            logger.error(f"Chat Archive: 初始化数据库失败: {e}")
+
+        # Cache blacklist as set for O(1) lookup
+        basic_conf = self.conf.get("basic", {}) if self.conf else {}
+        self._ignored_users: set[str] = {
+            str(u) for u in basic_conf.get("ignored_users", [])
+        }
+
+        self.web_server = None
+        if AdminServer:
+            web_conf = self.conf.get("web_server", {}) if self.conf else {}
+            if web_conf.get("enable", True):
+                host = web_conf.get("host", "0.0.0.0")
+                port = web_conf.get("port", 8090)
+                api_key = web_conf.get("api_key", "")
+
+                if not api_key:
+                    import secrets
+                    api_key = secrets.token_urlsafe(16)
+                    logger.warning("\n" + "=" * 60 +
+                                   f"\n[Chat Archive 安全警告] 您未在配置中指定访问验证 Key (api_key)！"
+                                   f"\n为了保障您的聊天记录隐私，系统已自动生成一个强随机密码："
+                                   f"\n👉👉 {api_key} 👈👈"
+                                   f"\n请使用上述密码登录 Web 仪表盘。您随时可以在插件的配置选项中设置自定义的 api_key。"
+                                   "\n" + "=" * 60 + "\n")
+
+                self.web_server = AdminServer(
+                    plugin_instance=self, host=host, port=port, api_key=api_key, cache_dir=STATIC_CACHE_DIR
+                )
+                self.web_server.run_in_thread()
+            else:
+                logger.info("Chat Archive: 内置 Web 面板已禁用（已通过外部或 systemd 解耦运行）。")
+
+        # Start clean-up background task
+        self._clean_task = None
+        try:
+            loop = asyncio.get_running_loop()
+            self._clean_task = loop.create_task(self._periodic_clean_loop())
+        except RuntimeError:
+            pass
+
+    async def terminate(self):
+        self._shutting_down = True
+        # Cancel the clean-up task
+        if self._clean_task and not self._clean_task.done():
+            self._clean_task.cancel()
+            try:
+                await self._clean_task
+            except asyncio.CancelledError:
+                pass
+
+        # Wait for all background tasks to finish
+        if self._background_tasks:
+            pending_tasks = [t for t in self._background_tasks if not t.done()]
+            if pending_tasks:
+                logger.info(f"Chat Archive: 等待 {len(pending_tasks)} 个后台任务执行完毕...")
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
+            self._background_tasks.clear()
+
+        # Cancel the batch writer and flush remaining messages
+        if self._writer_task and not self._writer_task.done():
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+
+        # Final flush of any remaining queued messages
+        remaining = []
+        while not self._write_queue.empty():
+            try:
+                remaining.append(self._write_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if remaining:
+            self._flush_batch_sync(remaining)
+
+        if self.web_server:
+            await self.web_server.stop()
+
+    async def _ensure_writer_started(self):
+        """Lazily start the background batch writer task."""
+        async with self._writer_lock:
+            if not self._shutting_down and (self._writer_task is None or self._writer_task.done()):
+                self._writer_task = asyncio.create_task(self._batch_writer())
+
+    async def _batch_writer(self):
+        """Background coroutine: drain queue and batch-insert to DB."""
+        buffer: list[tuple] = []
+        while True:
+            try:
+                # Wait for first item or timeout
+                try:
+                    item = await asyncio.wait_for(
+                        self._write_queue.get(), timeout=self._FLUSH_INTERVAL
+                    )
+                    buffer.append(item)
+                except asyncio.TimeoutError:
+                    pass
+
+                # Drain remaining items from queue (non-blocking)
+                while not self._write_queue.empty() and len(buffer) < self._BATCH_SIZE:
+                    try:
+                        buffer.append(self._write_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+
+                # Flush if buffer has data
+                if buffer:
+                    batch = buffer.copy()
+                    buffer.clear()
+                    await asyncio.to_thread(self._flush_batch_sync, batch)
+            except asyncio.CancelledError:
+                # Flush remaining on shutdown
+                while not self._write_queue.empty():
+                    try:
+                        buffer.append(self._write_queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if buffer:
+                    try:
+                        self._flush_batch_sync(buffer)
+                    except Exception as e:
+                        logger.error(f"Chat Archive: final flush error: {e}")
+                break
+            except Exception as e:
+                logger.error(
+                    f"Chat Archive: batch writer error, discarding {len(buffer)} messages: {e}"
+                )
+                buffer.clear()
+
+    def _flush_batch_sync(self, batch: list[tuple]):
+        """Flush a batch of messages to the database (runs in thread)."""
+        if not batch:
+            return
+        conn = None
+        retries = 3
+        delays = [0.5, 1.0, 2.0]
+        
+        for attempt in range(retries):
+            try:
+                conn = get_db_connection()
+                # session_name length matching the tuple
+                conn.executemany(
+                    "INSERT INTO chat_history (user_id, sender_name, message, timestamp, session_id, message_type, session_name, msg_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    batch,
+                )
+                conn.commit()
+                break
+            except sqlite3.OperationalError as e:
+                if attempt < retries - 1:
+                    logger.warning(f"Chat Archive: DB busy, retrying flush in {delays[attempt]}s: {e}")
+                    time.sleep(delays[attempt])
+                else:
+                    logger.error(f"Chat Archive: Failed to flush batch after retries ({len(batch)} msgs): {e}")
+            except Exception as e:
+                logger.error(
+                    f"Chat Archive: Failed to flush batch ({len(batch)} msgs): {e}"
+                )
+                break
+            finally:
+                if conn:
+                    conn.close()
+                    conn = None
+
+    @staticmethod
+    def _serialize_message_chain(chain) -> str:
+        """将 AstrBot 消息链序列化为包含 CQ 码的字符串，保留媒体 URL。"""
+        parts = []
+        for comp in chain:
+            cls_name = comp.__class__.__name__
+            try:
+                if cls_name == "Plain":
+                    parts.append(getattr(comp, "text", ""))
+                elif cls_name == "Image":
+                    url = getattr(comp, "url", "") or getattr(comp, "file", "")
+                    if url:
+                        parts.append(f"[CQ:image,url={url}]")
+                    else:
+                        parts.append("[CQ:image]")
+                elif cls_name == "Video":
+                    url = getattr(comp, "file", "") or getattr(comp, "url", "")
+                    if url:
+                        parts.append(f"[CQ:video,url={url}]")
+                    else:
+                        parts.append("[CQ:video]")
+                elif cls_name == "Record":
+                    url = getattr(comp, "url", "") or getattr(comp, "file", "")
+                    if url:
+                        parts.append(f"[CQ:record,url={url}]")
+                    else:
+                        parts.append("[语音]")
+                elif cls_name == "Face":
+                    face_id = getattr(comp, "id", "")
+                    parts.append(f"[CQ:face,id={face_id}]")
+                elif cls_name == "At":
+                    qq = getattr(comp, "qq", "")
+                    parts.append(f"[CQ:at,qq={qq}]")
+                elif cls_name == "Reply":
+                    rid = getattr(comp, "id", "")
+                    parts.append(f"[CQ:reply,id={rid}]")
+                elif cls_name in ("Forward", "Node", "Nodes"):
+                    parts.append("[合并转发]")
+                elif cls_name == "File":
+                    name = getattr(comp, "name", "文件")
+                    parts.append(f"[文件: {name}]")
+                elif cls_name == "Poke":
+                    parts.append("[戳一戳]")
+                else:
+                    text = getattr(comp, "text", None)
+                    if text:
+                        parts.append(str(text))
+            except Exception as e:
+                logger.debug(f"Chat Archive: failed to serialize {cls_name}: {e}")
+        return "".join(parts)
+
+    @staticmethod
+    @contextmanager
+    def _db_conn():
+        """Context manager for database connections."""
+        conn = None
+        try:
+            conn = get_db_connection()
+            yield conn
+        finally:
+            if conn:
+                conn.close()
+
+    async def _download_media_to_cache(self, url: str) -> str:
+        """下载媒体文件到本地缓存，并返回其相对 Web 路径 '/static/cache/...'。
+        如果下载失败，返回原始 URL。
+        """
+        if not url:
+            return ""
+        
+        # Check if url is already cached
+        if url.startswith("/static/cache/"):
+            return url
+            
+        # Security: Only allow http and https protocols to prevent local file disclosure or SSRF
+        parsed_url = urlparse(url)
+        if parsed_url.scheme not in ("http", "https"):
+            logger.warning(f"Chat Archive: 拒绝下载危险的 URL 协议 {url}")
+            return url
+
+        try:
+            STATIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Chat Archive: 创建缓存目录失败: {e}")
+            return url
+
+        # Generate filename
+        # Compute MD5 hash of URL
+        url_hash = hashlib.md5(url.encode("utf-8")).hexdigest()
+        
+        if url_hash not in self._download_locks:
+            self._download_locks[url_hash] = asyncio.Lock()
+            
+        async with self._download_locks[url_hash]:
+            # Try to guess extension from URL
+            ext = ""
+            url_lower = url.lower()
+            if ".png" in url_lower:
+                ext = ".png"
+            elif ".gif" in url_lower:
+                ext = ".gif"
+            elif ".webp" in url_lower:
+                ext = ".webp"
+            elif ".jpg" in url_lower or ".jpeg" in url_lower:
+                ext = ".jpg"
+            elif ".mp4" in url_lower:
+                ext = ".mp4"
+            elif ".webm" in url_lower:
+                ext = ".webm"
+            elif ".avi" in url_lower:
+                ext = ".avi"
+            elif ".mkv" in url_lower:
+                ext = ".mkv"
+            
+            # Default fallback if extension not found
+            if not ext:
+                if "video" in url_lower:
+                    ext = ".mp4"
+                else:
+                    ext = ".jpg"
+                    
+            filename = f"{url_hash}{ext}"
+            dest_path = STATIC_CACHE_DIR / filename
+            relative_url = f"/static/cache/{filename}"
+
+            # If already exists, return local path directly
+            if dest_path.exists():
+                return relative_url
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+                "Referer": "https://q.qq.com/",
+            }
+
+            try:
+                # Removed verify=False to comply with production security standards (MITM prevention)
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    async with client.stream("GET", url, headers=headers) as response:
+                        if response.status_code == 200:
+                            # Refine extension based on content-type if available
+                            content_type = response.headers.get("content-type", "")
+                            if content_type:
+                                content_type_lower = content_type.lower()
+                                new_ext = ""
+                                if "image/png" in content_type_lower:
+                                    new_ext = ".png"
+                                elif "image/gif" in content_type_lower:
+                                    new_ext = ".gif"
+                                elif "image/webp" in content_type_lower:
+                                    new_ext = ".webp"
+                                elif "image/jpeg" in content_type_lower:
+                                    new_ext = ".jpg"
+                                elif "video/mp4" in content_type_lower:
+                                    new_ext = ".mp4"
+                                elif "video/webm" in content_type_lower:
+                                    new_ext = ".webm"
+                                
+                                if new_ext:
+                                    filename = f"{url_hash}{new_ext}"
+                                    dest_path = STATIC_CACHE_DIR / filename
+                                    relative_url = f"/static/cache/{filename}"
+                                    if dest_path.exists():
+                                        return relative_url
+
+                            # Write to temp file first to avoid corrupted/partial file cache on interrupted downloads
+                            temp_path = dest_path.with_suffix(".tmp")
+                            with open(temp_path, "wb") as f:
+                                async for chunk in response.aiter_bytes():
+                                    f.write(chunk)
+                            temp_path.rename(dest_path)
+                            logger.info(f"Chat Archive: 成功缓存媒体到 {dest_path}")
+                            return relative_url
+                        else:
+                            logger.warning(f"Chat Archive: 下载媒体失败 {url}, 状态码 {response.status_code}")
+            except Exception as e:
+                logger.error(f"Chat Archive: 下载媒体异常 {url}: {e}")
+                
+            return url
+
+    async def _replace_cq_media_url(self, match) -> str:
+        cq_type = match.group(1)  # 'image' or 'video'
+        inner = match.group(2)
+        # Find url=...
+        url_match = re.search(r"url=(https?://[^,\]]+)", inner)
+        if url_match:
+            original_url = url_match.group(1)
+            # Decode potential XML/HTML entities in URL
+            url = original_url.replace("&amp;", "&").replace("&#44;", ",")
+            cached_url = await self._download_media_to_cache(url)
+            # Replace the original url with cached url in the CQ code
+            new_inner = inner.replace(original_url, cached_url)
+            return f"[CQ:{cq_type},{new_inner}]"
+        return match.group(0)
+
+    async def _process_and_cache_media_in_string(self, text: str) -> str:
+        """解析字符串中的 CQ 码，并下载其中的图片和视频媒体，替换为本地缓存路径。"""
+        if not text:
+            return text
+
+        pattern = r"\[CQ:(image|video),([^\]]+)\]"
+        matches = list(re.finditer(pattern, text))
+        if not matches:
+            return text
+
+        # Process matches from right to left to avoid index shifting
+        for match in reversed(matches):
+            replaced = await self._replace_cq_media_url(match)
+            start, end = match.span()
+            text = text[:start] + replaced + text[end:]
+
+        return text
+
+    @staticmethod
+    def _get_field(obj, key, default=None):
+        """兼容 dict-like 对象的字段提取。"""
+        if not obj:
+            return default
+        if hasattr(obj, "get") and callable(obj.get):
+            res = obj.get(key)
+            if res is not None:
+                return res
+        if hasattr(obj, "__getitem__"):
+            try:
+                res = obj[key]
+                if res is not None:
+                    return res
+            except (KeyError, TypeError):
+                pass
+        return getattr(obj, key, default)
+
+    @staticmethod
+    def _extract_from_dirty_str(s, key):
+        """从脏字符串中提取指定 key 的值。"""
+        if not isinstance(s, str):
+            return None
+        patterns = [
+            rf"['\"]{key}['\"]\s*:\s*['\"]([^'\"]*)['\"]",
+            rf"['\"]{key}['\"]\s*:\s*(\d+)",
+        ]
+        for p in patterns:
+            m = re.search(p, s)
+            if m:
+                return m.group(1)
+        return None
+
+    @filter.event_message_type(EventMessageType.ALL)
+    async def record_message(self, event: AstrMessageEvent):
+        """
+        拦截所有的消息事件，并存档至数据库。
+        """
+        # 读取配置
+        basic_conf = self.conf.get("basic", {}) if self.conf else {}
+        if not basic_conf.get("enable_archive", True):
+            return
+
+        cache_media = basic_conf.get("cache_media", False)
+
+        user_id = str(event.get_sender_id())
+
+        # O(1) blacklist lookup via cached set
+        if user_id in self._ignored_users:
+            return
+
+        # 1. 优先使用 AstrBot 消息链序列化（含已解析的媒体 URL）
+        raw_message = ""
+        try:
+            chain = event.get_messages()
+            if chain:
+                raw_message = self._serialize_message_chain(chain)
+        except Exception:
+            pass
+
+        # 2. 回退：尝试从平台原始事件对象中提取 raw_message (CQ 码字符串)
+        platform_raw = getattr(event.message_obj, "raw_message", None)
+        if not raw_message:
+            raw_message = self._get_field(platform_raw, "raw_message", "")
+
+            if isinstance(raw_message, str) and (
+                raw_message.startswith("<Event") or raw_message.startswith("{")
+            ):
+                extracted = self._extract_from_dirty_str(raw_message, "raw_message")
+                if extracted:
+                    raw_message = extracted
+
+        # 3. 提取基础信息
+        nickname = event.get_sender_name()
+
+        # 清理脏字符串形式的 user_id
+        if isinstance(user_id, str) and (
+            user_id.startswith("<Event") or user_id.startswith("{")
+        ):
+            extracted = self._extract_from_dirty_str(user_id, "user_id")
+            if extracted:
+                user_id = extracted
+
+        timestamp = self._get_field(platform_raw, "time", int(time.time()))
+        if isinstance(timestamp, str) and len(str(timestamp)) > 10:
+            extracted = self._extract_from_dirty_str(str(timestamp), "time")
+            if extracted:
+                timestamp = int(extracted)
+
+        # 4. 提取会话信息
+        session_id = event.unified_msg_origin
+        try:
+            message_type = event.get_message_type().value  # group or friend
+        except Exception:
+            message_type = str(event.get_message_type())
+
+        session_name = ""
+        try:
+            if message_type == "group":
+                if hasattr(event.message_obj, "group") and event.message_obj.group:
+                    session_name = event.message_obj.group.group_name or ""
+        except Exception:
+            pass
+
+        # 5. 终极兜底：如果还不是 clean 字符串，用 event.message_str
+        if (
+            not isinstance(raw_message, str)
+            or not raw_message
+            or raw_message.startswith("<Event")
+        ):
+            raw_message = event.message_str
+            if isinstance(raw_message, str) and raw_message.startswith("<Event"):
+                extracted = self._extract_from_dirty_str(raw_message, "raw_message")
+                raw_message = extracted if extracted else "[无法解析的消息]"
+
+        # 6. 处理消息回撤事件 (Notice Event in OneBot 11)
+        try:
+            notice_type = self._get_field(platform_raw, "notice_type", "")
+            if notice_type in ["group_recall", "friend_recall"]:
+                recalled_msg_id = str(self._get_field(platform_raw, "message_id", ""))
+                if recalled_msg_id:
+                    # 将对应的原始消息标记为已撤回
+                    def mark_recalled(m_id):
+                        c = None
+                        try:
+                            c = get_db_connection()
+                            c.execute(
+                                "UPDATE chat_history SET is_recalled = 1 WHERE msg_id = ?",
+                                (m_id,),
+                            )
+                            c.commit()
+                        except Exception as e:
+                            logger.error(
+                                f"Chat Archive: 标记撤回失败 {m_id}: {e}"
+                            )
+                        finally:
+                            if c:
+                                c.close()
+
+                    if not self._shutting_down:
+                        task = asyncio.create_task(
+                            asyncio.to_thread(mark_recalled, recalled_msg_id)
+                        )
+                        self._background_tasks.add(task)
+                        task.add_done_callback(self._background_tasks.discard)
+
+                    # 同时记录一条系统消息
+                    raw_message = f"🛡️ [撤回了一条消息 (ID: {recalled_msg_id})]"
+                    # 让系统消息的记录也进入队列，但标记为系统类型
+                    user_id = "0"
+                    nickname = "系统通知"
+        except Exception as e:
+            logger.error(f"Chat Archive: 撤回检测异常: {e}")
+
+        # 6.5. 缓存媒体原文件 (如果配置开启)
+        if cache_media and raw_message:
+            try:
+                raw_message = await self._process_and_cache_media_in_string(raw_message)
+            except Exception as e:
+                logger.error(f"Chat Archive: 缓存媒体文件失败: {e}")
+
+        # 7. 提取平台消息 ID
+        msg_id = str(getattr(event.message_obj, "message_id", ""))
+        if not msg_id:
+            msg_id = str(self._get_field(platform_raw, "message_id", ""))
+
+        if not user_id:
+            return
+
+        # Enqueue for batch write
+        await self._ensure_writer_started()
+        await self._write_queue.put(
+            (
+                str(user_id),
+                str(nickname),
+                str(raw_message),
+                int(timestamp),
+                str(session_id),
+                str(message_type),
+                str(session_name),
+                str(msg_id),
+            )
+        )
+
+    @filter.after_message_sent()
+    async def handle_bot_reply(self, event: AstrMessageEvent):
+        """
+        在机器人成功发送消息后，捕获并存档机器人自己的回复。
+        """
+        # 读取配置，检查是否开启存档
+        basic_conf = self.conf.get("basic", {}) if self.conf else {}
+        if not basic_conf.get("enable_archive", True):
+            return
+
+        result = event.get_result()
+        if not result or not result.chain:
+            return
+
+        try:
+            # 1. 序列化消息链
+            raw_message = self._serialize_message_chain(result.chain)
+            if not raw_message:
+                return
+
+            # 2. 检查是否开启缓存媒体文件并执行缓存
+            cache_media = basic_conf.get("cache_media", False)
+            if cache_media:
+                try:
+                    raw_message = await self._process_and_cache_media_in_string(raw_message)
+                except Exception as e:
+                    logger.error(f"Chat Archive: 缓存机器人媒体回复失败: {e}")
+
+            # 3. 构造机器人自己的基本信息
+            user_id = str(event.get_self_id() or "bot")
+            
+            # 获取机器人自身的昵称，如果获取不到则使用配置或默认名称
+            nickname = "Bot"
+            try:
+                if self.context and hasattr(self.context, "get_self_nickname"):
+                    nickname = self.context.get_self_nickname() or nickname
+                elif self.context and hasattr(self.context, "get_bot_name"):
+                    nickname = self.context.get_bot_name() or nickname
+            except Exception:
+                pass
+
+            timestamp = int(time.time())
+            session_id = str(event.unified_msg_origin or event.session_id)
+            
+            try:
+                message_type = event.get_message_type().value
+            except Exception:
+                try:
+                    message_type = str(event.get_message_type())
+                except Exception:
+                    message_type = "group"
+            
+            # 获取会话名称
+            session_name = ""
+            try:
+                session_name = event.get_group_name() or event.get_sender_name() or ""
+            except Exception:
+                pass
+
+            # 消息 ID，对于机器人回复，尽量从 platform 侧结果获取，没有则生成临时 ID
+            msg_id = f"bot_{timestamp}_{int(time.time() * 1000) % 1000}"
+
+            # 4. Enqueue for batch write
+            await self._ensure_writer_started()
+            await self._write_queue.put(
+                (
+                    str(user_id),
+                    str(nickname),
+                    str(raw_message),
+                    int(timestamp),
+                    str(session_id),
+                    str(message_type),
+                    str(session_name),
+                    str(msg_id),
+                )
+            )
+            
+        except Exception as e:
+            logger.error(f"Chat Archive: 记录机器人回复消息异常: {e}", exc_info=True)
+
+    # ==========================
+    # Third-party Plugin API (Python API)
+    # Access via: self.context.get_registered_star("astrbot_plugin_chat_archive")
+    # ==========================
+
+    @classmethod
+    def get_history(cls, *args, **kwargs) -> list[dict]:
+        """Advanced mixed query interface for chat history."""
+        return DatabaseManager.get_history(*args, **kwargs)
+
+    @classmethod
+    def get_sessions(cls) -> list[dict]:
+        """Get all sessions that have archived chat records."""
+        return DatabaseManager.get_sessions()
+
+    @classmethod
+    def get_member_rank(cls, *args, **kwargs) -> list[dict]:
+        """Get the top active members in a session by message count."""
+        return DatabaseManager.get_member_rank(*args, **kwargs)
+
+    @classmethod
+    def get_user_summary(cls, *args, **kwargs) -> dict:
+        """Get a statistical overview of a specific user."""
+        return DatabaseManager.get_user_summary(*args, **kwargs)
+
+    @classmethod
+    def get_message_count(cls, *args, **kwargs) -> int:
+        """Lightweight count query without fetching message data."""
+        return DatabaseManager.get_message_count(*args, **kwargs)
+
+    @classmethod
+    def get_context_messages(cls, *args, **kwargs) -> list[tuple[str, str, str]]:
+        """Convenience method for LLM context: returns formatted messages."""
+        return DatabaseManager.get_context_messages(*args, **kwargs)
+
+    @classmethod
+    def _execute_query(cls, *args, **kwargs) -> dict:
+        """Execute the actual database query (runs in thread)."""
+        return DatabaseManager.execute_query(*args, **kwargs)
+
+    async def _periodic_clean_loop(self):
+        """定期清理过期缓存文件的循环。每一天运行一次。"""
+        # Wait a small duration initially to let startup finish
+        await asyncio.sleep(5)
+        while True:
+            try:
+                basic_conf = self.conf.get("basic", {}) if self.conf else {}
+                enable_clean = basic_conf.get("enable_clean", False)
+                clean_days = basic_conf.get("clean_days", 30)
+
+                if enable_clean and clean_days > 0:
+                    await self._clean_expired_cache(clean_days)
+            except Exception as e:
+                logger.error(f"Chat Archive: 定期清理执行异常: {e}")
+            
+            # Sleep for 24 hours (86400 seconds)
+            await asyncio.sleep(86400)
+
+    async def _clean_expired_cache(self, days: int):
+        """物理清理几天前的缓存文件"""
+        if not STATIC_CACHE_DIR.exists():
+            return
+
+        now = time.time()
+        threshold = now - (days * 86400)
+
+        try:
+            def _scan_and_delete():
+                """在线程池中执行文件扫描与删除，避免阻塞事件循环。"""
+                cleaned_count = 0
+                cleaned_bytes = 0
+                for p in STATIC_CACHE_DIR.glob("*"):
+                    if p.is_file() and p.suffix != ".tmp":
+                        try:
+                            st = p.stat()
+                            if st.st_mtime < threshold:
+                                cleaned_bytes += st.st_size
+                                p.unlink()
+                                cleaned_count += 1
+                        except Exception as e:
+                            logger.debug(f"Chat Archive: 无法删除文件 {p}: {e}")
+                return cleaned_count, cleaned_bytes
+
+            cleaned_count, cleaned_bytes = await asyncio.to_thread(_scan_and_delete)
+
+            if cleaned_count > 0:
+                logger.info(f"Chat Archive: 清理了 {cleaned_count} 个过期媒体文件，释放空间 {cleaned_bytes / (1024 * 1024):.2f} MB。")
+        except Exception as e:
+            logger.error(f"Chat Archive: 清理过期缓存文件失败: {e}")

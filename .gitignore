@@ -1,0 +1,21 @@
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+
+# SQLite Database (Plugin Database & Temp Files)
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+
+# WebUI Local Media Cache
+web/static/cache/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
