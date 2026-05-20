@@ -5,6 +5,9 @@ import re
 import sqlite3
 import time
 import hashlib
+import ipaddress
+import socket
+import os
 from pathlib import Path
 from urllib.parse import urlparse
 import httpx
@@ -34,12 +37,32 @@ from astrbot.api import logger
 
 try:
     from astrbot.api.star import StarTools
-    DATA_DIR = StarTools.get_data_dir()
+    _env_data_dir = os.environ.get("ARCHIVE_DATA_DIR", "").strip()
+    if _env_data_dir:
+        _data_path = Path(os.path.expandvars(_env_data_dir)).expanduser()
+        DATA_DIR = (_data_path if _data_path.is_absolute() else Path(__file__).resolve().parent / _data_path).resolve()
+    else:
+        DATA_DIR = Path(StarTools.get_data_dir()).expanduser().resolve()
 except Exception:
     # Fallback for standalone decoupling execution or tests
-    DATA_DIR = Path(__file__).resolve().parent / "data"
+    _env_data_dir = os.environ.get("ARCHIVE_DATA_DIR", "").strip()
+    if _env_data_dir:
+        _data_path = Path(os.path.expandvars(_env_data_dir)).expanduser()
+        DATA_DIR = (_data_path if _data_path.is_absolute() else Path(__file__).resolve().parent / _data_path).resolve()
+    else:
+        DATA_DIR = (Path(__file__).resolve().parent / "data").resolve()
 
 STATIC_CACHE_DIR = DATA_DIR / "web_cache"
+
+DEFAULT_ALLOWED_MEDIA_DOMAINS = {
+    "multimedia.nt.qq.com.cn",
+    "gchat.qpic.cn",
+    "q.qlogo.cn",
+    "p.qlogo.cn",
+    "q1.qlogo.cn",
+    "gxh.vip.qq.com",
+}
+DEFAULT_MAX_MEDIA_BYTES = 50 * 1024 * 1024  # 50 MiB
 
 
 @register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "1.0.0")
@@ -59,7 +82,7 @@ class ChatArchivePlugin(Star):
         self._background_tasks = set()
 
         # Write buffer: queue + background writer
-        self._write_queue: asyncio.Queue = asyncio.Queue()
+        self._write_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
         self._writer_task: asyncio.Task | None = None
         self._writer_lock = asyncio.Lock()
 
@@ -80,9 +103,12 @@ class ChatArchivePlugin(Star):
         if AdminServer:
             web_conf = self.conf.get("web_server", {}) if self.conf else {}
             if web_conf.get("enable", True):
-                host = web_conf.get("host", "0.0.0.0")
-                port = web_conf.get("port", 8090)
-                api_key = web_conf.get("api_key", "")
+                host = os.environ.get("ARCHIVE_HOST", "").strip() or web_conf.get("host", "127.0.0.1")
+                try:
+                    port = int(os.environ.get("ARCHIVE_PORT", "").strip() or web_conf.get("port", 8090))
+                except (TypeError, ValueError):
+                    port = 8090
+                api_key = os.environ.get("ARCHIVE_API_KEY", "").strip() or web_conf.get("api_key", "")
 
                 if not api_key:
                     import secrets
@@ -154,6 +180,15 @@ class ChatArchivePlugin(Star):
             if not self._shutting_down and (self._writer_task is None or self._writer_task.done()):
                 self._writer_task = asyncio.create_task(self._batch_writer())
 
+    async def _enqueue_record(self, record: tuple):
+        """Enqueue a record with backpressure to avoid unbounded memory growth."""
+        if self._shutting_down:
+            return
+        try:
+            await asyncio.wait_for(self._write_queue.put(record), timeout=1.0)
+        except asyncio.TimeoutError:
+            logger.error("Chat Archive: 写入队列已满，丢弃一条归档记录以保护主进程内存。")
+
     async def _batch_writer(self):
         """Background coroutine: drain queue and batch-insert to DB."""
         buffer: list[tuple] = []
@@ -199,6 +234,18 @@ class ChatArchivePlugin(Star):
                 )
                 buffer.clear()
 
+    def _write_failed_batch(self, batch: list[tuple], reason: str):
+        """Persist failed DB writes for later manual recovery instead of silently losing them."""
+        try:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            failed_path = DATA_DIR / "chat_archive_failed_writes.jsonl"
+            with open(failed_path, "a", encoding="utf-8") as f:
+                for item in batch:
+                    f.write(json.dumps({"reason": reason, "record": item, "failed_at": int(time.time())}, ensure_ascii=False) + "\n")
+            logger.error(f"Chat Archive: {len(batch)} 条写入失败记录已保存到 {failed_path}")
+        except Exception as e:
+            logger.error(f"Chat Archive: 保存失败写入记录也失败了: {e}")
+
     def _flush_batch_sync(self, batch: list[tuple]):
         """Flush a batch of messages to the database (runs in thread)."""
         if not batch:
@@ -223,10 +270,12 @@ class ChatArchivePlugin(Star):
                     time.sleep(delays[attempt])
                 else:
                     logger.error(f"Chat Archive: Failed to flush batch after retries ({len(batch)} msgs): {e}")
+                    self._write_failed_batch(batch, str(e))
             except Exception as e:
                 logger.error(
                     f"Chat Archive: Failed to flush batch ({len(batch)} msgs): {e}"
                 )
+                self._write_failed_batch(batch, str(e))
                 break
             finally:
                 if conn:
@@ -296,6 +345,62 @@ class ChatArchivePlugin(Star):
             if conn:
                 conn.close()
 
+    def _get_allowed_media_domains(self) -> set[str]:
+        """Return configured media-cache domain allowlist."""
+        basic_conf = self.conf.get("basic", {}) if self.conf else {}
+        configured = basic_conf.get("allowed_media_domains", [])
+        domains = configured or list(DEFAULT_ALLOWED_MEDIA_DOMAINS)
+        return {str(d).strip().lower().rstrip(".") for d in domains if str(d).strip()}
+
+    def _get_max_media_bytes(self) -> int:
+        basic_conf = self.conf.get("basic", {}) if self.conf else {}
+        try:
+            mb = int(basic_conf.get("media_max_mb", 50))
+        except (TypeError, ValueError):
+            mb = 50
+        mb = max(1, min(mb, 200))
+        return mb * 1024 * 1024
+
+    @staticmethod
+    def _hostname_matches_allowlist(hostname: str, domains: set[str]) -> bool:
+        host = (hostname or "").lower().rstrip(".")
+        return any(host == d or host.endswith("." + d) for d in domains)
+
+    @staticmethod
+    def _ip_is_public(ip: ipaddress._BaseAddress) -> bool:
+        return not (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+
+    async def _hostname_resolves_to_public_ips(self, hostname: str) -> bool:
+        """Block localhost/private/link-local destinations before media caching."""
+        try:
+            try:
+                ip = ipaddress.ip_address(hostname)
+                return self._ip_is_public(ip)
+            except ValueError:
+                pass
+
+            infos = await asyncio.to_thread(
+                socket.getaddrinfo, hostname, None, type=socket.SOCK_STREAM
+            )
+            if not infos:
+                return False
+            for info in infos:
+                ip = ipaddress.ip_address(info[4][0])
+                if not self._ip_is_public(ip):
+                    logger.warning(f"Chat Archive: 拒绝缓存解析到非公网地址的媒体域名 {hostname} -> {ip}")
+                    return False
+            return True
+        except Exception as e:
+            logger.warning(f"Chat Archive: 媒体域名解析校验失败 {hostname}: {e}")
+            return False
+
     async def _download_media_to_cache(self, url: str) -> str:
         """下载媒体文件到本地缓存，并返回其相对 Web 路径 '/static/cache/...'。
         如果下载失败，返回原始 URL。
@@ -307,11 +412,22 @@ class ChatArchivePlugin(Star):
         if url.startswith("/static/cache/"):
             return url
             
-        # Security: Only allow http and https protocols to prevent local file disclosure or SSRF
+        # Security: only cache explicitly allowed public HTTP(S) media origins.
         parsed_url = urlparse(url)
         if parsed_url.scheme not in ("http", "https"):
             logger.warning(f"Chat Archive: 拒绝下载危险的 URL 协议 {url}")
             return url
+        hostname = parsed_url.hostname
+        if not hostname:
+            logger.warning(f"Chat Archive: 拒绝下载无效媒体 URL {url}")
+            return url
+        allowed_domains = self._get_allowed_media_domains()
+        if not self._hostname_matches_allowlist(hostname, allowed_domains):
+            logger.warning(f"Chat Archive: 拒绝缓存非白名单媒体域名 {hostname}")
+            return url
+        if not await self._hostname_resolves_to_public_ips(hostname):
+            return url
+        max_media_bytes = self._get_max_media_bytes()
 
         try:
             STATIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -368,45 +484,68 @@ class ChatArchivePlugin(Star):
             }
 
             try:
-                # Removed verify=False to comply with production security standards (MITM prevention)
-                async with httpx.AsyncClient(timeout=30.0) as client:
+                # Do not follow redirects automatically; a redirect could jump to a non-allowlisted/internal host.
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
                     async with client.stream("GET", url, headers=headers) as response:
-                        if response.status_code == 200:
-                            # Refine extension based on content-type if available
-                            content_type = response.headers.get("content-type", "")
-                            if content_type:
-                                content_type_lower = content_type.lower()
-                                new_ext = ""
-                                if "image/png" in content_type_lower:
-                                    new_ext = ".png"
-                                elif "image/gif" in content_type_lower:
-                                    new_ext = ".gif"
-                                elif "image/webp" in content_type_lower:
-                                    new_ext = ".webp"
-                                elif "image/jpeg" in content_type_lower:
-                                    new_ext = ".jpg"
-                                elif "video/mp4" in content_type_lower:
-                                    new_ext = ".mp4"
-                                elif "video/webm" in content_type_lower:
-                                    new_ext = ".webm"
-                                
-                                if new_ext:
-                                    filename = f"{url_hash}{new_ext}"
-                                    dest_path = STATIC_CACHE_DIR / filename
-                                    relative_url = f"/static/cache/{filename}"
-                                    if dest_path.exists():
-                                        return relative_url
+                        if response.status_code != 200:
+                            logger.warning(f"Chat Archive: 下载媒体失败 {url}, 状态码 {response.status_code}")
+                            return url
 
-                            # Write to temp file first to avoid corrupted/partial file cache on interrupted downloads
-                            temp_path = dest_path.with_suffix(".tmp")
+                        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                        if not (content_type.startswith("image/") or content_type.startswith("video/")):
+                            logger.warning(f"Chat Archive: 拒绝缓存非图片/视频响应 {url}, content-type={content_type or 'unknown'}")
+                            return url
+
+                        content_length = response.headers.get("content-length")
+                        if content_length:
+                            try:
+                                if int(content_length) > max_media_bytes:
+                                    logger.warning(f"Chat Archive: 拒绝缓存超大媒体 {url}, size={content_length}")
+                                    return url
+                            except ValueError:
+                                pass
+
+                        # Refine extension based on content-type.
+                        new_ext = ""
+                        if content_type == "image/png":
+                            new_ext = ".png"
+                        elif content_type == "image/gif":
+                            new_ext = ".gif"
+                        elif content_type == "image/webp":
+                            new_ext = ".webp"
+                        elif content_type in ("image/jpeg", "image/jpg"):
+                            new_ext = ".jpg"
+                        elif content_type == "video/mp4":
+                            new_ext = ".mp4"
+                        elif content_type == "video/webm":
+                            new_ext = ".webm"
+
+                        if new_ext:
+                            filename = f"{url_hash}{new_ext}"
+                            dest_path = STATIC_CACHE_DIR / filename
+                            relative_url = f"/static/cache/{filename}"
+                            if dest_path.exists():
+                                return relative_url
+
+                        # Write to temp file first to avoid corrupted/partial file cache on interrupted downloads.
+                        temp_path = dest_path.with_suffix(".tmp")
+                        downloaded = 0
+                        try:
                             with open(temp_path, "wb") as f:
                                 async for chunk in response.aiter_bytes():
+                                    downloaded += len(chunk)
+                                    if downloaded > max_media_bytes:
+                                        raise ValueError(f"media too large: {downloaded} bytes")
                                     f.write(chunk)
                             temp_path.rename(dest_path)
-                            logger.info(f"Chat Archive: 成功缓存媒体到 {dest_path}")
-                            return relative_url
-                        else:
-                            logger.warning(f"Chat Archive: 下载媒体失败 {url}, 状态码 {response.status_code}")
+                        except Exception:
+                            try:
+                                temp_path.unlink(missing_ok=True)
+                            except Exception:
+                                pass
+                            raise
+                        logger.info(f"Chat Archive: 成功缓存媒体到 {dest_path}")
+                        return relative_url
             except Exception as e:
                 logger.error(f"Chat Archive: 下载媒体异常 {url}: {e}")
                 
@@ -567,13 +706,13 @@ class ChatArchivePlugin(Star):
                 recalled_msg_id = str(self._get_field(platform_raw, "message_id", ""))
                 if recalled_msg_id:
                     # 将对应的原始消息标记为已撤回
-                    def mark_recalled(m_id):
+                    def mark_recalled(m_id, sess_id):
                         c = None
                         try:
                             c = get_db_connection()
                             c.execute(
-                                "UPDATE chat_history SET is_recalled = 1 WHERE msg_id = ?",
-                                (m_id,),
+                                "UPDATE chat_history SET is_recalled = 1 WHERE msg_id = ? AND session_id = ?",
+                                (m_id, str(sess_id)),
                             )
                             c.commit()
                         except Exception as e:
@@ -586,7 +725,7 @@ class ChatArchivePlugin(Star):
 
                     if not self._shutting_down:
                         task = asyncio.create_task(
-                            asyncio.to_thread(mark_recalled, recalled_msg_id)
+                            asyncio.to_thread(mark_recalled, recalled_msg_id, session_id)
                         )
                         self._background_tasks.add(task)
                         task.add_done_callback(self._background_tasks.discard)
@@ -616,7 +755,7 @@ class ChatArchivePlugin(Star):
 
         # Enqueue for batch write
         await self._ensure_writer_started()
-        await self._write_queue.put(
+        await self._enqueue_record(
             (
                 str(user_id),
                 str(nickname),
@@ -693,7 +832,7 @@ class ChatArchivePlugin(Star):
 
             # 4. Enqueue for batch write
             await self._ensure_writer_started()
-            await self._write_queue.put(
+            await self._enqueue_record(
                 (
                     str(user_id),
                     str(nickname),

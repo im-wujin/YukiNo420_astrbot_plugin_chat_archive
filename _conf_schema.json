@@ -25,6 +25,21 @@
                 "default": false,
                 "hint": "对于图片和视频，是否下载原文件缓存到本地，避免因为 QQ 原图过期或防盗链导致无法查看。"
             },
+            "allowed_media_domains": {
+                "type": "list",
+                "description": "允许缓存的媒体域名",
+                "default": ["multimedia.nt.qq.com.cn", "gchat.qpic.cn", "q.qlogo.cn", "p.qlogo.cn", "q1.qlogo.cn", "gxh.vip.qq.com"],
+                "hint": "仅下载这些域名及其子域名下的媒体，防止 SSRF 访问内网地址。",
+                "items": {
+                    "type": "string"
+                }
+            },
+            "media_max_mb": {
+                "type": "int",
+                "description": "单个媒体最大缓存体积 MB",
+                "default": 50,
+                "hint": "限制单个图片或视频的最大下载体积，取值会被限制在 1-200 MB。"
+            },
             "enable_clean": {
                 "type": "bool",
                 "description": "开启定期清理",
@@ -41,7 +56,13 @@
                 "type": "string",
                 "description": "数据库文件路径",
                 "default": "",
-                "hint": "自定义 SQLite 数据库文件路径。留空则使用插件目录下的默认位置 (data/chat_history.db)。修改后需要重启插件/服务以应用新路径。"
+                "hint": "自定义 SQLite 数据库文件路径。支持 ~、环境变量和相对路径；相对路径默认基于插件数据目录。也可用 ARCHIVE_DB_PATH 环境变量覆盖。留空则使用默认位置 (data/chat_history.db)。修改后需要重启插件/服务。"
+            },
+            "sqlite_journal_mode": {
+                "type": "string",
+                "description": "SQLite 日志模式",
+                "default": "WAL",
+                "hint": "默认 WAL 性能较好；如果数据库位于 NAS/NFS/SMB 等网络盘或遇到 database is locked，可改为 DELETE。也可用 ARCHIVE_SQLITE_JOURNAL_MODE 环境变量覆盖。可选：WAL、DELETE、TRUNCATE、PERSIST、MEMORY、OFF。"
             }
         }
     },
@@ -59,20 +80,20 @@
             "host": {
                 "type": "string",
                 "description": "监听地址",
-                "default": "0.0.0.0",
-                "hint": "Web 面板监听地址，0.0.0.0 允许从外部访问。"
+                "default": "127.0.0.1",
+                "hint": "Web 面板监听地址。默认 127.0.0.1 仅允许本机访问；如需局域网/公网访问可改为 0.0.0.0，并务必设置 api_key 与防火墙。也可用 ARCHIVE_HOST 环境变量覆盖。"
             },
             "port": {
                 "type": "int",
                 "description": "监听端口",
                 "default": 8090,
-                "hint": "Web 面板的监听端口。"
+                "hint": "Web 面板的监听端口。也可用 ARCHIVE_PORT 环境变量覆盖。"
             },
             "api_key": {
                 "type": "string",
                 "description": "访问验证 Key",
                 "default": "",
-                "hint": "为确保安全，必须配置此访问令牌。请任意输入一段安全的字符串密码。"
+                "hint": "为确保安全，必须配置此访问令牌。请任意输入一段安全的字符串密码。也可用 ARCHIVE_API_KEY 环境变量覆盖。"
             }
         }
     }

@@ -12,12 +12,28 @@ from astrbot.api import logger
 # Resolve default relative path under plugin directory
 PLUGIN_DIR = Path(__file__).resolve().parent
 
-try:
-    from astrbot.api.star import StarTools
-    DATA_DIR = StarTools.get_data_dir()
-except Exception:
-    # Fallback for standalone decoupling execution or tests
-    DATA_DIR = PLUGIN_DIR / "data"
+def _expand_path(path_value: str, base_dir: Path | None = None) -> Path:
+    """Expand ~, environment variables and relative paths in a cross-platform way."""
+    expanded = os.path.expandvars(str(path_value)).strip()
+    path = Path(expanded).expanduser()
+    if not path.is_absolute():
+        path = (base_dir or DATA_DIR) / path
+    return path.resolve()
+
+
+def _get_data_dir() -> Path:
+    env_data_dir = os.environ.get("ARCHIVE_DATA_DIR", "").strip()
+    if env_data_dir:
+        return _expand_path(env_data_dir, PLUGIN_DIR)
+    try:
+        from astrbot.api.star import StarTools
+        return Path(StarTools.get_data_dir()).expanduser().resolve()
+    except Exception:
+        # Fallback for standalone decoupling execution or tests
+        return (PLUGIN_DIR / "data").resolve()
+
+
+DATA_DIR = _get_data_dir()
 
 DEFAULT_DB_PATH = str(DATA_DIR / "chat_history.db")
 
@@ -33,6 +49,8 @@ class Database:
     def fetchall(self):
         raise NotImplementedError
     def commit(self):
+        raise NotImplementedError
+    def rollback(self):
         raise NotImplementedError
     def close(self):
         raise NotImplementedError
@@ -55,7 +73,8 @@ class SQLiteConnectionPool:
         # Allow cross-thread connection usage under safe queue-based reuse
         conn = sqlite3.connect(self.db_path, timeout=20, check_same_thread=False)
         conn.row_factory = self._dict_factory
-        conn.execute("PRAGMA journal_mode=WAL;")
+        journal_mode = _load_sqlite_journal_mode()
+        conn.execute(f"PRAGMA journal_mode={journal_mode};")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
 
@@ -76,31 +95,77 @@ class SQLiteConnectionPool:
 
     def release_connection(self, conn):
         if conn:
-            self.pool.put(conn)
+            try:
+                self.pool.put_nowait(conn)
+            except queue.Full:
+                logger.warning("SQLite connection pool is full; closing returned connection.")
+                try:
+                    conn.close()
+                finally:
+                    with self._lock:
+                        self._allocated = max(0, self._allocated - 1)
 
     def close_all(self):
+        closed = 0
         while not self.pool.empty():
             try:
                 conn = self.pool.get_nowait()
                 conn.close()
+                closed += 1
             except queue.Empty:
                 break
+        if closed:
+            with self._lock:
+                self._allocated = max(0, self._allocated - closed)
 
 
-def _load_db_path() -> str:
+def _get_config_path() -> Path:
+    env_config_path = os.environ.get("ARCHIVE_CONFIG_PATH", "").strip()
+    if env_config_path:
+        return _expand_path(env_config_path, PLUGIN_DIR)
+
     config_path = DATA_DIR.parent.parent / "config" / "astrbot_plugin_chat_archive_config.json"
     if not config_path.exists():
         config_path = PLUGIN_DIR.parent.parent / "config" / "astrbot_plugin_chat_archive_config.json"
+    return config_path
+
+
+def _load_db_path() -> str:
+    env_db_path = os.environ.get("ARCHIVE_DB_PATH", "").strip()
+    if env_db_path:
+        return str(_expand_path(env_db_path, DATA_DIR))
+
+    config_path = _get_config_path()
     if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8-sig") as f:
                 data = json.load(f)
                 custom_path = data.get("basic", {}).get("db_path", "")
                 if custom_path:
-                    return custom_path
+                    return str(_expand_path(custom_path, DATA_DIR))
         except (json.JSONDecodeError, OSError) as e:
             logger.warning(f"Failed to read custom db path from config: {e}")
-    return DEFAULT_DB_PATH
+    return str(_expand_path(DEFAULT_DB_PATH, DATA_DIR))
+
+
+def _load_sqlite_journal_mode() -> str:
+    allowed_modes = {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}
+    mode = os.environ.get("ARCHIVE_SQLITE_JOURNAL_MODE", "").strip().upper()
+    if not mode:
+        config_path = _get_config_path()
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                    mode = str(data.get("basic", {}).get("sqlite_journal_mode", "WAL")).strip().upper()
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to read sqlite journal mode from config: {e}")
+                mode = "WAL"
+    mode = mode or "WAL"
+    if mode not in allowed_modes:
+        logger.warning(f"Unsupported SQLite journal mode '{mode}', fallback to WAL.")
+        mode = "WAL"
+    return mode
 
 DB_PATH = _load_db_path()
 
@@ -170,6 +235,10 @@ class SQLiteDatabase(Database):
         if self._conn:
             self._conn.commit()
 
+    def rollback(self):
+        if self._conn:
+            self._conn.rollback()
+
     def close(self):
         if self._conn:
             if self._pool:
@@ -190,6 +259,11 @@ class SQLiteDatabase(Database):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is not None:
+            try:
+                self.rollback()
+            except Exception as e:
+                logger.error(f"SQLiteDatabase rollback failed: {e}")
         self.close()
 
 def get_db_connection() -> Database:
@@ -244,7 +318,8 @@ class DatabaseManager:
                     params.append(int(until_ts))
 
                 order = "ASC" if asc else "DESC"
-                query += f" ORDER BY timestamp {order} LIMIT ? OFFSET ?"
+                id_order = "ASC" if asc else "DESC"
+                query += f" ORDER BY timestamp {order}, id {id_order} LIMIT ? OFFSET ?"
                 params.extend([limit, offset])
 
                 cursor = conn.execute(query, params)
@@ -534,7 +609,7 @@ def migrate_v4(db):
         db.execute("ALTER TABLE chat_history ADD COLUMN is_recalled INTEGER DEFAULT 0;")
 
 def init_db():
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    Path(DB_PATH).expanduser().parent.mkdir(parents=True, exist_ok=True)
     db = get_db_connection()
     try:
         # 检测表是否已存在

@@ -67,6 +67,25 @@ function showAuth(show) {
     else overlay.classList.add('hidden');
 }
 
+async function ensureAuthCookie() {
+    if (!API_KEY) return false;
+    try {
+        const res = await fetch('/api/auth/verify', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ api_key: API_KEY })
+        });
+        if (res.status === 401) {
+            showAuth(true);
+            return false;
+        }
+        return res.ok;
+    } catch (e) {
+        console.warn('Auth cookie refresh failed', e);
+        return false;
+    }
+}
+
 async function verifyLogin() {
     const key = document.getElementById('api-key-input').value;
     try {
@@ -89,7 +108,12 @@ async function verifyLogin() {
     }
 }
 
-function logout() {
+async function logout() {
+    try {
+        await fetch('/api/auth/logout', { method: 'POST', headers: { 'X-API-Key': API_KEY } });
+    } catch (e) {
+        console.warn('Logout request failed', e);
+    }
     localStorage.removeItem('astr_chat_key');
     location.reload();
 }
@@ -139,7 +163,7 @@ function formatMsg(text) {
     function proxyUrl(url) {
         const proxyDomains = ['multimedia.nt.qq.com.cn', 'gchat.qpic.cn'];
         if (proxyDomains.some(d => url.includes(d))) {
-            return `/api/proxy/image?url=${encodeURIComponent(url)}&key=${encodeURIComponent(API_KEY)}`;
+            return `/api/proxy/image?url=${encodeURIComponent(url)}`;
         }
         return url;
     }
@@ -213,7 +237,7 @@ function formatMsg(text) {
     // Recall Links
     escaped = escaped.replace(/🛡️ \[撤回了一条消息 \(ID: ([^\]]+)\)\]/g, (match, id) => {
         const safeId = escapeAttr(id);
-        return `🛡️ [撤回了一条消息 (ID: <span class="recall-link" onclick="scrollToMsg('${safeId}')">${safeId}</span>)]`;
+        return `🛡️ [撤回了一条消息 (ID: <span class="recall-link" data-msg-id="${safeId}">${safeId}</span>)]`;
     });
 
     return escaped;
@@ -247,6 +271,19 @@ window.scrollToMsg = (msgId) => {
         }
     }
 };
+
+document.addEventListener('click', (event) => {
+    const recall = event.target.closest('.recall-link[data-msg-id]');
+    if (recall) {
+        scrollToMsg(recall.getAttribute('data-msg-id') || '');
+        return;
+    }
+
+    const copy = event.target.closest('.msg-id[data-copy-id]');
+    if (copy) {
+        copyToClipboard(copy.getAttribute('data-copy-id') || '');
+    }
+});
 
 function getAvatarUrl(userId) {
     if (/^\d+$/.test(userId)) {
@@ -333,7 +370,7 @@ async function fetchSessions() {
                         selectSession(s.session_id, s.name, s.message_type);
                     };
 
-                    const avatarUrl = s.avatar || getAvatarUrl('fallback');
+                    const avatarUrl = escapeAttr(s.avatar || getAvatarUrl('fallback'));
                     item.innerHTML = `
                         <img class="session-avatar" src="${avatarUrl}" onerror="this.src=getAvatarUrl('fallback')" />
                         <div class="session-info">
@@ -717,7 +754,7 @@ async function fetchHistory(append = false) {
                     <div class="msg-bubble animate-fade ${isRecalled ? 'recalled-msg' : ''}" data-msg-id="${escapeAttr(msg.msg_id || '')}">
                         <div class="msg-text">${formatMsg(msg.message)}</div>
                         <div class="msg-footer">
-                            <span class="msg-id" title="平台消息ID" onclick="copyToClipboard('${escapeAttr(msg.msg_id)}')">#${escapeAttr(msg.msg_id) || 'N/A'}</span>
+                            <span class="msg-id" title="平台消息ID" data-copy-id="${escapeAttr(msg.msg_id || '')}">#${escapeAttr(msg.msg_id) || 'N/A'}</span>
                             ${isRecalled ? '<span class="msg-tag" style="background:rgba(239, 68, 68, 0.1); color:var(--danger); border-color:rgba(239,68,68,0.2);">已撤回</span>' : ''}
                             <span>${formatTime(msg.timestamp).split(' ')[1]}</span>
                         </div>
@@ -745,7 +782,7 @@ async function fetchHistory(append = false) {
                         <div class="content-col">
                             <div class="msg-author">
                                 <span class="author-name"></span> 
-                                <span class="author-id">#${msg.user_id}</span>
+                                <span class="author-id"></span>
                             </div>
                             <div class="msg-bubble-list">
                                 ${messageHtml}
@@ -753,6 +790,7 @@ async function fetchHistory(append = false) {
                         </div>
                     `;
                     group.querySelector('.author-name').textContent = msg.sender_name;
+                    group.querySelector('.author-id').textContent = `#${msg.user_id}`;
                     fragment.appendChild(group);
                     renderMessageCard = group;
                     renderUserId = msg.user_id;
@@ -832,6 +870,8 @@ async function initApp() {
         showAuth(true);
         return;
     }
+    const ok = await ensureAuthCookie();
+    if (!ok) return;
     showAuth(false);
 
     // 移动端侧边栏由 CSS :checked + 全局点击关闭控制
