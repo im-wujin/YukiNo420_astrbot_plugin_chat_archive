@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 import httpx
 from contextlib import contextmanager
+from typing import Any
 
 try:
     from .db_config import get_db_connection, init_db, DatabaseManager
@@ -24,8 +25,13 @@ except ImportError:
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core import AstrBotConfig
+from astrbot.core.agent.run_context import ContextWrapper
+from astrbot.core.agent.tool import FunctionTool, ToolExecResult
+from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.star.filter.event_message_type import EventMessageType
+from pydantic import Field
+from pydantic.dataclasses import dataclass
 
 # 尝试导入 web server
 try:
@@ -65,6 +71,271 @@ DEFAULT_ALLOWED_MEDIA_DOMAINS = {
 DEFAULT_MAX_MEDIA_BYTES = 50 * 1024 * 1024  # 50 MiB
 
 
+def _archive_json_result(data: Any) -> str:
+    """Serialize archive query results for LLM tool calls."""
+    return json.dumps(data, ensure_ascii=False, default=str)
+
+
+@dataclass
+class ArchiveGetHistoryTool(FunctionTool[AstrAgentContext]):
+    """LLM tool: query archived chat history."""
+
+    name: str = "archive_get_history"
+    description: str = (
+        "查询聊天存档历史记录。可按用户、会话、关键词、时间范围分页查询，"
+        "返回消息列表，适合查找某段对话、某人发言或包含特定关键词的消息。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "可选，用户 ID；传入后仅查询该用户的消息。",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "可选，会话 ID/群聊 ID；传入后仅查询该会话的消息。",
+                },
+                "keyword": {
+                    "type": "string",
+                    "description": "可选，消息关键词；用于模糊搜索消息正文。",
+                },
+                "since_ts": {
+                    "type": "integer",
+                    "description": "可选，起始 Unix 时间戳（秒），只返回此时间之后的消息。",
+                },
+                "until_ts": {
+                    "type": "integer",
+                    "description": "可选，结束 Unix 时间戳（秒），只返回此时间之前的消息。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "可选，最多返回条数，默认 50。",
+                    "default": 50,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "可选，分页偏移量，默认 0。",
+                    "default": 0,
+                },
+                "asc": {
+                    "type": "boolean",
+                    "description": "可选，是否按时间升序返回；false 表示最新消息优先，默认 true。",
+                    "default": True,
+                },
+                "exclude_recalled": {
+                    "type": "boolean",
+                    "description": "可选，是否排除已撤回消息，默认 true。",
+                    "default": True,
+                },
+            },
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return _archive_json_result(
+            await asyncio.to_thread(self.plugin.get_history, **kwargs)
+        )
+
+
+@dataclass
+class ArchiveGetSessionsTool(FunctionTool[AstrAgentContext]):
+    """LLM tool: list archived sessions."""
+
+    name: str = "archive_get_sessions"
+    description: str = (
+        "获取所有存在聊天存档的会话列表。返回每个会话的 session_id、消息类型、"
+        "消息数量和最后消息时间，可用于先定位要查询的群聊/私聊会话。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {},
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return _archive_json_result(await asyncio.to_thread(self.plugin.get_sessions))
+
+
+@dataclass
+class ArchiveGetMemberRankTool(FunctionTool[AstrAgentContext]):
+    """LLM tool: rank active members."""
+
+    name: str = "archive_get_member_rank"
+    description: str = (
+        "查询指定会话内成员活跃排行，按发言数量从高到低返回。"
+        "适合回答谁最活跃、某段时间内群内发言排行等问题。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "必填，会话 ID/群聊 ID。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "可选，返回排行人数，默认 10。",
+                    "default": 10,
+                },
+                "since_ts": {
+                    "type": "integer",
+                    "description": "可选，起始 Unix 时间戳（秒）。",
+                },
+                "until_ts": {
+                    "type": "integer",
+                    "description": "可选，结束 Unix 时间戳（秒）。",
+                },
+            },
+            "required": ["session_id"],
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return _archive_json_result(
+            await asyncio.to_thread(self.plugin.get_member_rank, **kwargs)
+        )
+
+
+@dataclass
+class ArchiveGetUserSummaryTool(FunctionTool[AstrAgentContext]):
+    """LLM tool: summarize one user."""
+
+    name: str = "archive_get_user_summary"
+    description: str = (
+        "查询指定用户的存档统计概览，包括总消息数、首次出现时间、最后发言时间、"
+        "最近昵称等；可选限定在某个会话内统计。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "必填，用户 ID。",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "可选，会话 ID/群聊 ID；传入后只统计该会话内的数据。",
+                },
+            },
+            "required": ["user_id"],
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return _archive_json_result(
+            await asyncio.to_thread(self.plugin.get_user_summary, **kwargs)
+        )
+
+
+@dataclass
+class ArchiveGetMessageCountTool(FunctionTool[AstrAgentContext]):
+    """LLM tool: count messages."""
+
+    name: str = "archive_get_message_count"
+    description: str = (
+        "轻量统计聊天存档消息数量。可按用户、会话、时间范围筛选，"
+        "适合回答总共有多少条消息、某人/某群某段时间发了多少条等问题。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "user_id": {
+                    "type": "string",
+                    "description": "可选，用户 ID；传入后只统计该用户消息。",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "可选，会话 ID/群聊 ID；传入后只统计该会话消息。",
+                },
+                "since_ts": {
+                    "type": "integer",
+                    "description": "可选，起始 Unix 时间戳（秒）。",
+                },
+                "until_ts": {
+                    "type": "integer",
+                    "description": "可选，结束 Unix 时间戳（秒）。",
+                },
+                "exclude_recalled": {
+                    "type": "boolean",
+                    "description": "可选，是否排除已撤回消息，默认 true。",
+                    "default": True,
+                },
+            },
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return _archive_json_result(
+            await asyncio.to_thread(self.plugin.get_message_count, **kwargs)
+        )
+
+
+@dataclass
+class ArchiveGetContextMessagesTool(FunctionTool[AstrAgentContext]):
+    """LLM tool: get formatted context messages."""
+
+    name: str = "archive_get_context_messages"
+    description: str = (
+        "获取适合 LLM 阅读的上下文消息列表。返回格式为 "
+        "[时间字符串, 发送者昵称, 消息内容]，适合在需要回顾某个会话近期上下文时调用。"
+    )
+    parameters: dict = Field(
+        default_factory=lambda: {
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "必填，会话 ID/群聊 ID。",
+                },
+                "user_id": {
+                    "type": "string",
+                    "description": "可选，用户 ID；传入后只返回该用户的上下文消息。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "可选，返回消息条数，默认 50。",
+                    "default": 50,
+                },
+                "exclude_recalled": {
+                    "type": "boolean",
+                    "description": "可选，是否排除已撤回消息，默认 true。",
+                    "default": True,
+                },
+            },
+            "required": ["session_id"],
+        }
+    )
+    plugin: Any = None
+
+    async def call(
+        self, context: ContextWrapper[AstrAgentContext], **kwargs
+    ) -> ToolExecResult:
+        return _archive_json_result(
+            await asyncio.to_thread(self.plugin.get_context_messages, **kwargs)
+        )
+
+
 @register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "1.0.0")
 class ChatArchivePlugin(Star):
     # Batch writer configuration
@@ -92,6 +363,8 @@ class ChatArchivePlugin(Star):
             logger.info("Chat Archive: 数据库与表结构初始化成功。")
         except Exception as e:
             logger.error(f"Chat Archive: 初始化数据库失败: {e}")
+
+        self._register_llm_tools()
 
         # Cache blacklist as set for O(1) lookup
         basic_conf = self.conf.get("basic", {}) if self.conf else {}
@@ -134,6 +407,21 @@ class ChatArchivePlugin(Star):
             self._clean_task = loop.create_task(self._periodic_clean_loop())
         except RuntimeError:
             pass
+
+    def _register_llm_tools(self):
+        """注册聊天存档查询 LLM 工具到 AstrBot Context。"""
+        try:
+            self.context.add_llm_tools(
+                ArchiveGetHistoryTool(plugin=self),
+                ArchiveGetSessionsTool(plugin=self),
+                ArchiveGetMemberRankTool(plugin=self),
+                ArchiveGetUserSummaryTool(plugin=self),
+                ArchiveGetMessageCountTool(plugin=self),
+                ArchiveGetContextMessagesTool(plugin=self),
+            )
+            logger.info("Chat Archive: 已注册 6 个 LLM 查询工具。")
+        except Exception as e:
+            logger.warning(f"Chat Archive: 注册 LLM 查询工具失败: {e}")
 
     async def terminate(self):
         self._shutting_down = True
