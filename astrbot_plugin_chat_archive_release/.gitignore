@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+data/
+web_cache/
+chat_archive_failed_writes.jsonl

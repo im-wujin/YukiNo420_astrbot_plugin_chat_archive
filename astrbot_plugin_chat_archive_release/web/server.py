@@ -82,6 +82,15 @@ def _load_api_key() -> str:
 
 API_KEY = _load_api_key()
 
+DEFAULT_ALLOWED_MEDIA_DOMAINS = {
+    "multimedia.nt.qq.com.cn",
+    "gchat.qpic.cn",
+    "q.qlogo.cn",
+    "p.qlogo.cn",
+    "q1.qlogo.cn",
+    "gxh.vip.qq.com",
+}
+
 
 def _load_media_max_bytes() -> int:
     """Load max proxied media size from env/config; default 50 MiB, clamped to 1-200 MiB."""
@@ -103,6 +112,37 @@ def _load_media_max_bytes() -> int:
         mb = 50
     mb = max(1, min(mb, 200))
     return mb * 1024 * 1024
+
+
+def _load_allowed_media_domains() -> frozenset[str]:
+    env_domains = os.environ.get("ARCHIVE_ALLOWED_MEDIA_DOMAINS", "").strip()
+    domains = []
+    if env_domains:
+        domains = [part.strip() for part in env_domains.split(",")]
+    else:
+        config_path = _get_config_path()
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8-sig") as f:
+                    config_data = json.load(f)
+                    domains = config_data.get("basic", {}).get(
+                        "allowed_media_domains", []
+                    )
+            except Exception as e:
+                logger.warning(f"读取媒体域名白名单失败，使用默认值: {e}")
+    if isinstance(domains, str):
+        domains = [part.strip() for part in domains.split(",")]
+    cleaned = {
+        str(domain).strip().lower().rstrip(".")
+        for domain in domains
+        if str(domain).strip()
+    }
+    return frozenset(cleaned or DEFAULT_ALLOWED_MEDIA_DOMAINS)
+
+
+def _hostname_matches_allowlist(hostname: str, domains: frozenset[str]) -> bool:
+    host = (hostname or "").lower().rstrip(".")
+    return any(host == domain or host.endswith("." + domain) for domain in domains)
 
 
 def _ip_is_public(ip: ipaddress._BaseAddress) -> bool:
@@ -142,6 +182,7 @@ async def _hostname_resolves_to_public_ips(hostname: str) -> bool:
 
 
 MEDIA_MAX_BYTES = _load_media_max_bytes()
+ALLOWED_MEDIA_DOMAINS = _load_allowed_media_domains()
 
 @lru_cache(maxsize=1)
 def load_right_align_ids():
@@ -250,9 +291,14 @@ async def verify_auth(request: Request):
     return JSONResponse(status_code=401, content={"success": False, "message": "Invalid API Key"})
 
 @app.post("/api/auth/logout")
-async def logout_auth():
+async def logout_auth(request: Request):
     resp = JSONResponse(content={"success": True})
-    resp.delete_cookie("archive_auth")
+    resp.delete_cookie(
+        "archive_auth",
+        httponly=True,
+        samesite="lax",
+        secure=request.url.scheme == "https",
+    )
     return resp
 
 @app.get("/api/history")
@@ -376,90 +422,72 @@ async def proxy_image(url: str = Query(..., max_length=4096)):
     # 容错：替换转义的 &amp;
     url = url.replace("&amp;", "&")
 
-    # 安全校验：仅允许代理指定的域名（精准匹配 hostname 规避 SSRF）
+    # 安全校验：仅允许代理指定的域名（支持显式白名单及其子域名）
     try:
         parsed_url = urlparse(url)
         if parsed_url.scheme not in ("http", "https"):
             raise HTTPException(status_code=400, detail="Invalid URL scheme")
-        hostname = parsed_url.hostname
+        hostname = (parsed_url.hostname or "").lower().rstrip(".")
         if not hostname:
             raise HTTPException(status_code=400, detail="Invalid URL")
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid URL")
 
-    allowed_domains = ["multimedia.nt.qq.com.cn", "gchat.qpic.cn", "q.qlogo.cn", "p.qlogo.cn", "q1.qlogo.cn"]
-    if hostname not in allowed_domains:
+    if not _hostname_matches_allowlist(hostname, ALLOWED_MEDIA_DOMAINS):
         raise HTTPException(status_code=403, detail="Forbidden domain")
     if not await _hostname_resolves_to_public_ips(hostname):
         raise HTTPException(status_code=403, detail="Forbidden DNS target")
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+        "Referer": "https://q.qq.com/",
+    }
+    client = httpx.AsyncClient(timeout=30.0, follow_redirects=False)
+    try:
+        request = client.build_request("GET", url, headers=headers)
+        response = await client.send(request, stream=True)
+    except Exception as e:
+        await client.aclose()
+        logger.error(f"Media proxy open stream error for {url}: {e}")
+        raise HTTPException(status_code=502, detail="Media upstream unavailable")
+
+    if response.status_code != 200:
+        await response.aclose()
+        await client.aclose()
+        raise HTTPException(status_code=response.status_code, detail="Media upstream failed")
+
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if not (content_type.startswith("image/") or content_type.startswith("video/")):
+        await response.aclose()
+        await client.aclose()
+        logger.warning(f"Media proxy rejected non-image/video response: {url}, content-type={content_type or 'unknown'}")
+        raise HTTPException(status_code=415, detail="Unsupported media type")
+
+    content_length = response.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > MEDIA_MAX_BYTES:
+                await response.aclose()
+                await client.aclose()
+                logger.warning(f"Media proxy rejected oversized response by content-length: {url}, size={content_length}")
+                raise HTTPException(status_code=413, detail="Media too large")
+        except ValueError:
+            pass
+
     async def stream_media():
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-            "Referer": "https://q.qq.com/",
-        }
-        # Removed verify=False to comply with production security standards (MITM prevention)
-        async with httpx.AsyncClient() as client:
-            try:
-                async with client.stream(
-                    "GET", url, headers=headers, timeout=30.0
-                ) as response:
-                    if response.status_code != 200:
-                        yield b""
-                        return
-                    content_length = response.headers.get("content-length")
-                    if content_length:
-                        try:
-                            if int(content_length) > MEDIA_MAX_BYTES:
-                                logger.warning(f"Media proxy rejected oversized response by content-length: {url}, size={content_length}")
-                                yield b""
-                                return
-                        except ValueError:
-                            pass
-
-                    downloaded = 0
-                    async for chunk in response.aiter_bytes():
-                        downloaded += len(chunk)
-                        if downloaded > MEDIA_MAX_BYTES:
-                            logger.warning(f"Media proxy stopped oversized stream: {url}, size>{MEDIA_MAX_BYTES}")
-                            return
-                        yield chunk
-            except Exception as e:
-                logger.error(f"Media proxy error for {url}: {e}")
-                yield b""
-
-    # 自动检测内容类型：支持图片和视频
-    url_lower = url.lower()
-    content_type = "application/octet-stream"
-    # 视频类型
-    if ".mp4" in url_lower or "video" in url_lower:
-        content_type = "video/mp4"
-    elif ".webm" in url_lower:
-        content_type = "video/webm"
-    elif ".avi" in url_lower:
-        content_type = "video/x-msvideo"
-    elif ".mkv" in url_lower:
-        content_type = "video/x-matroska"
-    # 音频类型
-    elif ".mp3" in url_lower:
-        content_type = "audio/mpeg"
-    elif ".amr" in url_lower:
-        content_type = "audio/amr"
-    elif ".silk" in url_lower or ".slk" in url_lower:
-        content_type = "audio/silk"
-    elif ".ogg" in url_lower:
-        content_type = "audio/ogg"
-    elif ".wav" in url_lower:
-        content_type = "audio/wav"
-    # 图片类型
-    elif ".png" in url_lower:
-        content_type = "image/png"
-    elif ".gif" in url_lower:
-        content_type = "image/gif"
-    elif ".webp" in url_lower:
-        content_type = "image/webp"
-    else:
-        content_type = "image/jpeg"
+        downloaded = 0
+        try:
+            async for chunk in response.aiter_bytes():
+                downloaded += len(chunk)
+                if downloaded > MEDIA_MAX_BYTES:
+                    logger.warning(f"Media proxy stopped oversized stream: {url}, size>{MEDIA_MAX_BYTES}")
+                    return
+                yield chunk
+        except Exception as e:
+            logger.error(f"Media proxy error for {url}: {e}")
+        finally:
+            await response.aclose()
+            await client.aclose()
 
     return StreamingResponse(stream_media(), media_type=content_type)
 
@@ -538,7 +566,11 @@ def get_stats(
         
         conditions = ["1=1"]
         params = []
-        if session_id:
+        if session_id == "legacy:archive":
+            conditions.append(
+                "(session_id IS NULL OR session_id = '' OR session_id = 'legacy:archive')"
+            )
+        elif session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
         if user_id:

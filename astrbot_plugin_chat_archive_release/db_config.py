@@ -96,6 +96,18 @@ class SQLiteConnectionPool:
     def release_connection(self, conn):
         if conn:
             try:
+                if conn.in_transaction:
+                    conn.rollback()
+                    logger.warning("Rolled back pending SQLite transaction before returning connection to pool.")
+            except Exception as e:
+                logger.error(f"SQLite connection rollback before pool release failed: {e}")
+                try:
+                    conn.close()
+                finally:
+                    with self._lock:
+                        self._allocated = max(0, self._allocated - 1)
+                return
+            try:
                 self.pool.put_nowait(conn)
             except queue.Full:
                 logger.warning("SQLite connection pool is full; closing returned connection.")
@@ -273,6 +285,17 @@ def get_db_connection() -> Database:
 class DatabaseManager:
     """Manages all complex query operations for chat history to keep plugin class slim."""
 
+    _MAX_QUERY_LIMIT = 500
+    _MAX_QUERY_OFFSET = 100000
+
+    @staticmethod
+    def _clamp_int(value, default: int, minimum: int, maximum: int) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = default
+        return max(minimum, min(number, maximum))
+
     @staticmethod
     def get_history(
         user_id: str = None,
@@ -286,6 +309,12 @@ class DatabaseManager:
         exclude_recalled: bool = True,
     ) -> list[dict]:
         try:
+            limit = DatabaseManager._clamp_int(
+                limit, 50, 1, DatabaseManager._MAX_QUERY_LIMIT
+            )
+            offset = DatabaseManager._clamp_int(
+                offset, 0, 0, DatabaseManager._MAX_QUERY_OFFSET
+            )
             with get_db_connection() as conn:
                 query = (
                     "SELECT id, user_id, sender_name, message, timestamp, "
@@ -351,6 +380,9 @@ class DatabaseManager:
         until_ts: int = None,
     ) -> list[dict]:
         try:
+            limit = DatabaseManager._clamp_int(
+                limit, 10, 1, DatabaseManager._MAX_QUERY_LIMIT
+            )
             with get_db_connection() as conn:
                 query = (
                     "SELECT user_id, sender_name, COUNT(*) as count "

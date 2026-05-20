@@ -138,6 +138,16 @@ function escapeAttr(s) {
     return String(s).replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/'/g,'&#39;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function safeText(value, fallback = '') {
+    if (value === null || value === undefined) return fallback;
+    return String(value);
+}
+
+function safeCount(value) {
+    const n = Number(value);
+    return Number.isFinite(n) ? n : 0;
+}
+
 function formatMsg(text) {
     if (!text) return "";
 
@@ -177,7 +187,7 @@ function formatMsg(text) {
             url = proxyUrl(url);
             if (!isSafeUrl(url)) return `<span class="msg-tag">🖼️ [图片]</span>`;
             const safeUrl = escapeAttr(url);
-            return `<a href="${safeUrl}" target="_blank"><img src="${safeUrl}" class="msg-image" alt="图片" loading="lazy" onerror="this.parentElement.outerHTML='<span class=\\'msg-tag\\' style=\\'opacity:0.6;\\'>🖼️ [图片]</span>'" /></a>`;
+            return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer"><img src="${safeUrl}" class="msg-image" alt="图片" loading="lazy" onerror="this.parentElement.outerHTML='<span class=\\'msg-tag\\' style=\\'opacity:0.6;\\'>🖼️ [图片]</span>'" /></a>`;
         }
         return `<span class="msg-tag">🖼️ [图片]</span>`;
     });
@@ -312,6 +322,45 @@ function showSkeleton(containerId, count = 5) {
     }
 }
 
+function createMessageBubble(msg) {
+    const isRecalled = msg.is_recalled === 1;
+    const bubble = document.createElement('div');
+    bubble.className = `msg-bubble animate-fade ${isRecalled ? 'recalled-msg' : ''}`;
+    bubble.dataset.msgId = safeText(msg.msg_id);
+
+    const text = document.createElement('div');
+    text.className = 'msg-text';
+    text.innerHTML = formatMsg(msg.message);
+
+    const footer = document.createElement('div');
+    footer.className = 'msg-footer';
+
+    const id = document.createElement('span');
+    id.className = 'msg-id';
+    id.title = '平台消息ID';
+    id.dataset.copyId = safeText(msg.msg_id);
+    id.textContent = `#${safeText(msg.msg_id, 'N/A') || 'N/A'}`;
+    footer.appendChild(id);
+
+    if (isRecalled) {
+        const recalled = document.createElement('span');
+        recalled.className = 'msg-tag';
+        recalled.style.background = 'rgba(239, 68, 68, 0.1)';
+        recalled.style.color = 'var(--danger)';
+        recalled.style.borderColor = 'rgba(239,68,68,0.2)';
+        recalled.textContent = '已撤回';
+        footer.appendChild(recalled);
+    }
+
+    const time = document.createElement('span');
+    time.textContent = formatTime(msg.timestamp).split(' ')[1] || '';
+    footer.appendChild(time);
+
+    bubble.appendChild(text);
+    bubble.appendChild(footer);
+    return bubble;
+}
+
 async function fetchSessions() {
     try {
         const data = await fetchAPI('/api/sessions');
@@ -347,10 +396,17 @@ async function fetchSessions() {
 
                 const header = document.createElement('div');
                 header.className = 'category-header';
-                header.innerHTML = `
-                    <span>${groupData.name} <small style="opacity:0.5; font-weight:normal;">${groupData.items.length}</small></span>
-                    <span class="toggle-icon">▼</span>
-                `;
+                const label = document.createElement('span');
+                label.textContent = `${groupData.name} `;
+                const count = document.createElement('small');
+                count.style.opacity = '0.5';
+                count.style.fontWeight = 'normal';
+                count.textContent = groupData.items.length;
+                label.appendChild(count);
+                const toggle = document.createElement('span');
+                toggle.className = 'toggle-icon';
+                toggle.textContent = '▼';
+                header.append(label, toggle);
 
                 const content = document.createElement('div');
                 content.className = 'category-content';
@@ -371,17 +427,21 @@ async function fetchSessions() {
                     };
 
                     const avatarUrl = escapeAttr(s.avatar || getAvatarUrl('fallback'));
+                    const lastTime = safeCount(s.last_time);
+                    const lastDate = lastTime
+                        ? new Date(lastTime * 1000).toLocaleDateString()
+                        : '';
                     item.innerHTML = `
                         <img class="session-avatar" src="${avatarUrl}" onerror="this.src=getAvatarUrl('fallback')" />
                         <div class="session-info">
                             <div class="session-meta">
-                                <span>${new Date(s.last_time * 1000).toLocaleDateString()}</span>
+                                <span>${escapeAttr(lastDate)}</span>
                             </div>
                             <div class="session-name"></div>
                             <div class="session-last">${formatMsg(s.last_msg)}</div>
                         </div>
                     `;
-                    item.querySelector('.session-name').textContent = s.name;
+                    item.querySelector('.session-name').textContent = safeText(s.name);
                     content.appendChild(item);
                 });
 
@@ -415,15 +475,19 @@ async function selectSession(sessionId, name, msgType) {
     if (activeUserId !== '') activeUserId = '';
     window.userMap = {};
 
-    const activeItem = document.querySelector(`.session-item[data-session-id="${sessionId}"]`);
+    const activeItem = document.querySelector(`.session-item[data-session-id="${CSS.escape(sessionId)}"]`);
     if (activeItem && activeMsgType !== 'friend') {
         const subMenu = document.createElement('div');
         subMenu.className = 'sidebar-sub-menu';
 
         const searchBox = document.createElement('div');
         searchBox.className = 'sub-menu-search';
-        searchBox.innerHTML = `<input type="text" id="memberSearch" placeholder="定位成员..." onclick="event.stopPropagation()">`;
-        const searchInput = searchBox.querySelector('input');
+        const searchInput = document.createElement('input');
+        searchInput.type = 'text';
+        searchInput.id = 'memberSearch';
+        searchInput.placeholder = '定位成员...';
+        searchInput.addEventListener('click', (event) => event.stopPropagation());
+        searchBox.appendChild(searchInput);
 
         const userListContainer = document.createElement('div');
         userListContainer.id = 'userListContainer';
@@ -453,8 +517,22 @@ function renderUserList(filter = '') {
     filtered.forEach(u => {
         const subItem = document.createElement('div');
         subItem.className = `sub-menu-item ${activeUserId === u.user_id ? 'active' : ''}`;
-        subItem.innerHTML = `<span style="display:flex; align-items:center; gap:0.4rem; overflow:hidden;"><img src="${getAvatarUrl(u.user_id)}" onerror="this.src=getAvatarUrl('fallback')" style="width:20px; height:20px; border-radius:50%; flex-shrink:0; object-fit:cover;" /> <span class="sub-name" style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis;"></span></span> <small style="opacity:0.6; flex-shrink:0;">${u.count}</small>`;
-        subItem.querySelector('.sub-name').textContent = u.sender_name;
+        const wrap = document.createElement('span');
+        wrap.style.cssText = 'display:flex; align-items:center; gap:0.4rem; overflow:hidden;';
+        const avatar = document.createElement('img');
+        avatar.src = getAvatarUrl(safeText(u.user_id));
+        avatar.onerror = () => { avatar.src = getAvatarUrl('fallback'); };
+        avatar.style.cssText = 'width:20px; height:20px; border-radius:50%; flex-shrink:0; object-fit:cover;';
+        const name = document.createElement('span');
+        name.className = 'sub-name';
+        name.style.cssText = 'white-space:nowrap; overflow:hidden; text-overflow:ellipsis;';
+        name.textContent = safeText(u.sender_name);
+        wrap.append(avatar, name);
+        const count = document.createElement('small');
+        count.style.opacity = '0.6';
+        count.style.flexShrink = '0';
+        count.textContent = safeCount(u.count);
+        subItem.append(wrap, count);
         subItem.onclick = (e) => {
             e.stopPropagation();
             if (activeUserId === u.user_id) {
@@ -501,15 +579,17 @@ async function reloadStats() {
 
 function renderBarChartUI(distribution) {
     if (!distribution || distribution.length !== 12) return '';
-    let maxCount = Math.max(...distribution, 1);
+    const values = distribution.map(safeCount);
+    let maxCount = Math.max(...values, 1);
     let html = `<div class="bar-chart-container animate-fade">`;
     for (let i = 0; i < 12; i++) {
-        let h = maxCount > 0 ? (distribution[i] / maxCount) * 100 : 0;
+        const value = values[i];
+        let h = maxCount > 0 ? (value / maxCount) * 100 : 0;
         let timeLabel = `${i * 2}:00 - ${i * 2 + 2}:00`;
         html += `
             <div class="bar-wrapper">
                 <div class="bar animate-grow-bar" style="height: 0%;" data-height="${h}%"></div>
-                <div class="bar-tooltip">${timeLabel}<br/>${distribution[i]}条</div>
+                <div class="bar-tooltip">${timeLabel}<br/>${value.toLocaleString()}条</div>
                 <div class="bar-label">${i * 2}</div>
             </div>
         `;
@@ -544,8 +624,8 @@ function updateAnalysisPanel(data) {
 
     let html = '';
     if (isIndividual) {
-        let activeDays = data.active_days || 0;
-        let textLen = data.avg_text_length || 0;
+        let activeDays = safeCount(data.active_days);
+        let textLen = safeCount(data.avg_text_length);
 
         let peakTime = "无";
         let peakVal = 0;
@@ -561,19 +641,19 @@ function updateAnalysisPanel(data) {
         html += `
             <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 8px;">
                 <div class="stat-card" style="padding: 0.8rem 0.5rem;" title="这段时间内该成员发出的消息总条数">
-                    <div class="value" style="font-size: 1.2rem;">${data.total_messages.toLocaleString()}</div>
+                    <div class="value" style="font-size: 1.2rem;">${safeCount(data.total_messages).toLocaleString()}</div>
                     <div class="label">发言数</div>
                 </div>
                 <div class="stat-card" style="padding: 0.8rem 0.5rem;" title="刨除掉媒体与CQ等代码后，每发一条纯文字时的平均字符长度">
-                    <div class="value" style="font-size: 1.2rem;">${textLen} 字</div>
+                    <div class="value" style="font-size: 1.2rem;">${textLen.toLocaleString()} 字</div>
                     <div class="label">均字长度</div>
                 </div>
                 <div class="stat-card" style="padding: 0.8rem 0.5rem;" title="真正有过发话记录的活跃天数">
-                    <div class="value" style="font-size: 1.2rem;">${activeDays} 天</div>
+                    <div class="value" style="font-size: 1.2rem;">${activeDays.toLocaleString()} 天</div>
                     <div class="label">活跃天数</div>
                 </div>
                 <div class="stat-card" style="padding: 0.8rem 0.5rem;" title="在一天之中按统计倾向概率最爱出没的高频时间起势">
-                    <div class="value" style="font-size: 1.2rem;">${peakTime}</div>
+                    <div class="value" style="font-size: 1.2rem;">${escapeAttr(peakTime)}</div>
                     <div class="label">巅峰出没期</div>
                 </div>
             </div>
@@ -582,11 +662,11 @@ function updateAnalysisPanel(data) {
         html += `
             <div style="display:flex; gap:10px;">
                 <div class="stat-card" style="flex:1; padding: 1rem 0.5rem;">
-                    <div class="value" style="font-size: 1.5rem;">${data.total_messages.toLocaleString()}</div>
+                    <div class="value" style="font-size: 1.5rem;">${safeCount(data.total_messages).toLocaleString()}</div>
                     <div class="label">该时段发言数</div>
                 </div>
                 <div class="stat-card" style="flex:1; padding: 1rem 0.5rem;" title="无论选取何时间段，此项固定为选定记录全局今日总揽">
-                    <div class="value" style="font-size: 1.5rem;">${data.today_messages.toLocaleString()}</div>
+                    <div class="value" style="font-size: 1.5rem;">${safeCount(data.today_messages).toLocaleString()}</div>
                     <div class="label">全局今日数</div>
                 </div>
             </div>
@@ -603,11 +683,11 @@ function updateAnalysisPanel(data) {
     if (isIndividual) {
         html += `<div style="margin-top: 0.5rem;"><div class="section-title">📝 消息形式分析</div><div class="type-list">`;
         data.message_types.forEach(t => {
-            if (t.value > 0) {
+            if (safeCount(t.value) > 0) {
                 html += `
                     <div class="type-item animate-fade">
-                        <div class="type-name"><span>${t.name}</span></div>
-                        <div class="type-value">${t.value}</div>
+                        <div class="type-name"><span>${escapeAttr(t.name)}</span></div>
+                        <div class="type-value">${safeCount(t.value).toLocaleString()}</div>
                     </div>
                 `;
             }
@@ -633,7 +713,7 @@ function updateAnalysisPanel(data) {
                     <img src="${getAvatarUrl(u.user_id)}" class="rank-avatar" onerror="this.src=getAvatarUrl('fallback')" />
                     <div class="rank-info">
                         <div class="rank-name">${safeName}</div>
-                        <div class="rank-count">${u.count} 条消息</div>
+                        <div class="rank-count">${safeCount(u.count).toLocaleString()} 条消息</div>
                     </div>
                 </div>
             `;
@@ -647,10 +727,7 @@ function updateAnalysisPanel(data) {
         document.querySelectorAll('#analysisContent .rank-item').forEach(item => {
             item.addEventListener('click', () => {
                 activeUserId = item.getAttribute('data-user-id');
-                const unameRaw = item.getAttribute('data-user-name');
-                const decoder = document.createElement('div');
-                decoder.innerHTML = unameRaw;
-                const uname = decoder.textContent;
+                const uname = item.dataset.userName || '';
 
                 document.querySelectorAll('.sub-menu-item').forEach(el => {
                     if (el.innerText.includes(uname)) el.classList.add('active');
@@ -743,23 +820,15 @@ async function fetchHistory(append = false) {
                 if (dateStr !== renderDateStr) {
                     const divider = document.createElement('div');
                     divider.className = 'date-divider animate-fade';
-                    divider.innerHTML = `<span>${dateStr}</span>`;
+                    const dateLabel = document.createElement('span');
+                    dateLabel.textContent = dateStr;
+                    divider.appendChild(dateLabel);
                     fragment.appendChild(divider);
                     renderDateStr = dateStr;
                     renderUserId = null; // Next message forces new group wrapper
                 }
 
-                const isRecalled = msg.is_recalled === 1;
-                const messageHtml = `
-                    <div class="msg-bubble animate-fade ${isRecalled ? 'recalled-msg' : ''}" data-msg-id="${escapeAttr(msg.msg_id || '')}">
-                        <div class="msg-text">${formatMsg(msg.message)}</div>
-                        <div class="msg-footer">
-                            <span class="msg-id" title="平台消息ID" data-copy-id="${escapeAttr(msg.msg_id || '')}">#${escapeAttr(msg.msg_id) || 'N/A'}</span>
-                            ${isRecalled ? '<span class="msg-tag" style="background:rgba(239, 68, 68, 0.1); color:var(--danger); border-color:rgba(239,68,68,0.2);">已撤回</span>' : ''}
-                            <span>${formatTime(msg.timestamp).split(' ')[1]}</span>
-                        </div>
-                    </div>
-                `;
+                const bubble = createMessageBubble(msg);
 
                 if (msg.user_id === '0' || msg.user_id === 0) {
                     // System message: center it
@@ -771,7 +840,7 @@ async function fetchHistory(append = false) {
                     renderMessageCard = null;
                 } else if (renderUserId === msg.user_id && renderMessageCard) {
                     const bubbleList = renderMessageCard.querySelector('.msg-bubble-list');
-                    bubbleList.insertAdjacentHTML('beforeend', messageHtml);
+                    bubbleList.appendChild(bubble);
                 } else {
                     const group = document.createElement('div');
                     group.className = `message-group animate-fade${msg.is_right ? ' msg-right' : ''}`;
@@ -784,13 +853,12 @@ async function fetchHistory(append = false) {
                                 <span class="author-name"></span> 
                                 <span class="author-id"></span>
                             </div>
-                            <div class="msg-bubble-list">
-                                ${messageHtml}
-                            </div>
+                            <div class="msg-bubble-list"></div>
                         </div>
                     `;
-                    group.querySelector('.author-name').textContent = msg.sender_name;
-                    group.querySelector('.author-id').textContent = `#${msg.user_id}`;
+                    group.querySelector('.author-name').textContent = safeText(msg.sender_name);
+                    group.querySelector('.author-id').textContent = `#${safeText(msg.user_id)}`;
+                    group.querySelector('.msg-bubble-list').appendChild(bubble);
                     fragment.appendChild(group);
                     renderMessageCard = group;
                     renderUserId = msg.user_id;
@@ -839,8 +907,8 @@ async function fetchStats() {
     try {
         const data = await fetchAPI('/api/stats');
         if (data.success) {
-            document.getElementById('stat-total').innerText = data.data.total_messages.toLocaleString();
-            document.getElementById('stat-today').innerText = data.data.today_messages.toLocaleString();
+            document.getElementById('stat-total').innerText = safeCount(data.data.total_messages).toLocaleString();
+            document.getElementById('stat-today').innerText = safeCount(data.data.today_messages).toLocaleString();
         }
     } catch (e) { }
 }
@@ -957,6 +1025,10 @@ function closeAllPanels() {
 document.addEventListener('DOMContentLoaded', () => {
     initApp();
 
+    const loginBtn = document.getElementById('login-btn');
+    const logoutBtn = document.getElementById('logout-btn');
+    const apiKeyInput = document.getElementById('api-key-input');
+    const searchInput = document.getElementById('searchInput');
     const btnSidebar = document.getElementById('btn-sidebar');
     const btnAnalysis = document.getElementById('btn-analysis');
     const btnCloseSidebar = document.getElementById('btn-close-sidebar');
@@ -964,6 +1036,26 @@ document.addEventListener('DOMContentLoaded', () => {
     const overlay = document.getElementById('mobile-overlay');
     const sidebar = document.querySelector('.sidebar');
     const analysis = document.querySelector('.analysis-panel');
+
+    if (loginBtn) {
+        loginBtn.addEventListener('click', verifyLogin);
+    }
+
+    if (logoutBtn) {
+        logoutBtn.addEventListener('click', logout);
+    }
+
+    if (apiKeyInput) {
+        apiKeyInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') verifyLogin();
+        });
+    }
+
+    if (searchInput) {
+        searchInput.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') handleSearch();
+        });
+    }
 
     if (btnSidebar) {
         btnSidebar.addEventListener('click', () => {

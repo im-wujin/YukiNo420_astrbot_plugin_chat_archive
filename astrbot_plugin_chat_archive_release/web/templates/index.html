@@ -22,7 +22,7 @@
             <h2 style="margin-bottom: 0.5rem; font-weight: 800;">访问控制</h2>
             <p style="color: var(--text-muted); margin-bottom: 2.5rem; font-size: 0.9rem;">Chat Archive Admin Panel</p>
             <input type="password" id="api-key-input" placeholder="输入 API Key">
-            <button class="primary-btn" style="width: 100%;" onclick="verifyLogin()">验证并进入</button>
+            <button class="primary-btn" id="login-btn" style="width: 100%;">验证并进入</button>
             <p id="auth-error"
                 style="color: var(--danger); margin-top: 1.25rem; font-size: 0.8rem; display: none; font-weight: 600;">
                 Key 校验失败</p>
@@ -50,7 +50,7 @@
             <!-- Sessions injected here -->
         </div>
         <div style="padding: 1.25rem; border-top: 1px solid var(--glass-border); background: rgba(15, 23, 42, 0.4);">
-            <button class="primary-btn" onclick="logout()"
+            <button class="primary-btn" id="logout-btn"
                 style="background: rgba(255,255,255,0.05); font-size: 0.75rem; width: 100%; border: 1px solid var(--glass-border);">退出登录</button>
         </div>
     </div>
@@ -71,8 +71,7 @@
                         <circle cx="11" cy="11" r="8"></circle>
                         <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
                     </svg>
-                    <input type="text" id="searchInput" placeholder="搜索..."
-                        onkeydown="if(event.key === 'Enter') handleSearch()">
+                    <input type="text" id="searchInput" placeholder="搜索...">
                 </div>
             </div>
         </header>
