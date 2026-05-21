@@ -367,7 +367,7 @@ class ArchiveGetContextMessagesTool(FunctionTool[AstrAgentContext]):
         )
 
 
-@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "1.2")
+@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "v1.2")
 class ChatArchivePlugin(Star):
     # Batch writer configuration
     _BATCH_SIZE = 50
