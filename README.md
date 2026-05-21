@@ -88,6 +88,64 @@ python3 -m astrbot_plugin_chat_archive.web.server
 
 ---
 
+## 📦 发布仓库范围
+
+本仓库是插件的发布仓库，根目录即 AstrBot 插件目录。推送内容应保持精简，只包含运行插件所必需的文件。
+
+当前 GitHub 仓库结构：
+
+```text
+astrbot_plugin_chat_archive/
+├── .gitignore
+├── CHANGELOG.md
+├── DEVELOPER.md
+├── LICENSE
+├── README.md
+├── _conf_schema.json
+├── contrib/
+│   └── astr_archive_web.service
+├── db_config.py
+├── logo.png
+├── main.py
+├── metadata.yaml
+├── requirements.txt
+└── web/
+    ├── server.py
+    ├── static/
+    │   ├── css/main.css
+    │   ├── js/main.js
+    │   └── logo.png
+    └── templates/index.html
+```
+
+允许推送：
+
+- 插件运行代码：`main.py`、`db_config.py`、`web/`
+- 插件元数据与配置：`metadata.yaml`、`_conf_schema.json`、`requirements.txt`
+- 用户说明与发布记录：`README.md`、`CHANGELOG.md`、`LICENSE`
+- 运行或部署所需资源：`logo.png`、`contrib/`
+
+不要推送：
+
+- 测试目录或测试脚本：`tests/`、`test_*.py`
+- 开发文档、评审记录、实现计划：`docs/`、`implementation_plan.md`、`*_review.md`
+- Python/前端缓存与构建产物：`__pycache__/`、`.pytest_cache/`、`node_modules/`、`dist/`
+- 本地运行数据：数据库、日志、媒体缓存、临时文件
+- 与本次功能发布无关的实验代码或草稿
+
+推送前建议检查：
+
+```bash
+git fetch origin main
+git status --short
+git diff --stat
+git ls-tree -r --name-only HEAD
+```
+
+确认只包含上述允许范围内的文件后再提交和推送。
+
+---
+
 ## 🏗️ 系统架构
 
 ```mermaid
