@@ -124,7 +124,7 @@ python3 -m astrbot_plugin_chat_archive.web.server
 当前 GitHub 仓库结构：
 
 ```text
-astrbot_plugin_chat_archive/
+/
 ├── .gitignore
 ├── CHANGELOG.md
 ├── DEVELOPER.md
