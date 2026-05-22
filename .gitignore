@@ -11,10 +11,12 @@ venv/
 data/
 web_cache/
 chat_archive_failed_writes.jsonl
+implementation_plan.md
 
 # WebUI Local Media Cache
 web/static/cache/
 
 # OS-specific files
 .DS_Store
+._*
 Thumbs.db
