@@ -2,7 +2,7 @@
     "basic": {
         "description": "基础设置",
         "type": "object",
-        "hint": "控制聊天记录存档的基本行为",
+        "hint": "控制聊天消息存档的基本行为",
         "items": {
             "enable_archive": {
                 "type": "bool",

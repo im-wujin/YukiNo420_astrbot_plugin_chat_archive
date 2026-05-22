@@ -212,7 +212,11 @@ function getImageDisplayStyle(width, height) {
 
 function formatSessionPreview(text) {
     if (!text) return '';
-    return String(text)
+    const rawText = String(text);
+    const previewText = isShareJsonPayload(rawText.trim())
+        ? formatSharePreview(rawText.trim())
+        : replaceCqJsonCodes(rawText, data => formatSharePreview(data));
+    return previewText
         .replace(/\[CQ:image,[^\]]*\]/g, '[图片]')
         .replace(/\[CQ:video,[^\]]*\]/g, '[视频]')
         .replace(/\[CQ:record,[^\]]*\]/g, '[语音]')
@@ -222,6 +226,219 @@ function formatSessionPreview(text) {
         .replace(/\[CQ:reply,[^\]]*\]/g, '[回复]')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+function findCqJsonEnd(text, dataStart) {
+    let braceDepth = 0;
+    let inString = false;
+    let escaped = false;
+    let started = false;
+
+    for (let i = dataStart; i < text.length; i++) {
+        const ch = text[i];
+
+        if (!started) {
+            if (/\s/.test(ch)) continue;
+            if (ch !== '{') return -1;
+            started = true;
+        }
+
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (ch === '\\') {
+                escaped = true;
+            } else if (ch === '"') {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (ch === '"') {
+            inString = true;
+        } else if (ch === '{') {
+            braceDepth++;
+        } else if (ch === '}') {
+            braceDepth--;
+            if (braceDepth === 0) {
+                let closeIndex = i + 1;
+                while (closeIndex < text.length && /\s/.test(text[closeIndex])) closeIndex++;
+                return text[closeIndex] === ']' ? closeIndex : -1;
+            }
+        }
+    }
+
+    return -1;
+}
+
+function replaceCqJsonCodes(text, replacer) {
+    const prefix = '[CQ:json,data=';
+    let output = '';
+    let cursor = 0;
+
+    while (cursor < text.length) {
+        const start = text.indexOf(prefix, cursor);
+        if (start === -1) {
+            output += text.slice(cursor);
+            break;
+        }
+
+        const dataStart = start + prefix.length;
+        let end = findCqJsonEnd(text, dataStart);
+        let data = end === -1 ? '' : text.slice(dataStart, end);
+
+        if (end === -1 || !parseCqJsonData(data)) {
+            for (let probe = text.indexOf(']', dataStart); probe !== -1; probe = text.indexOf(']', probe + 1)) {
+                const candidate = text.slice(dataStart, probe);
+                if (parseCqJsonData(candidate)) {
+                    end = probe;
+                    data = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (end === -1) {
+            output += text.slice(cursor);
+            break;
+        }
+
+        output += text.slice(cursor, start);
+        output += replacer(data);
+        cursor = end + 1;
+    }
+
+    return output;
+}
+
+function decodeCqJsonData(data) {
+    if (!data) return '';
+    let decoded = String(data);
+    const entities = {
+        '&quot;': '"',
+        '&#34;': '"',
+        '&#39;': "'",
+        '&apos;': "'",
+        '&#44;': ',',
+        '&#91;': '[',
+        '&#93;': ']',
+        '&lt;': '<',
+        '&gt;': '>',
+        '&amp;': '&'
+    };
+
+    for (let i = 0; i < 3; i++) {
+        const next = decoded.replace(/&(quot|apos|lt|gt|amp);|&#(34|39|44|91|93);/g, match => entities[match] || match);
+        if (next === decoded) break;
+        decoded = next;
+    }
+    return decoded;
+}
+
+function parseCqJsonData(data) {
+    try {
+        return JSON.parse(decodeCqJsonData(data));
+    } catch (err) {
+        return null;
+    }
+}
+
+function getJsonFieldFromText(text, field) {
+    if (!text) return '';
+    const reg = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
+    const match = String(text).match(reg);
+    if (!match) return '';
+    return match[1]
+        .replace(/\\"/g, '"')
+        .replace(/\\\\\//g, '/')
+        .replace(/\\\\n/g, '\n')
+        .trim();
+}
+
+function firstText(...values) {
+    for (const value of values) {
+        if (typeof value === 'string' && value.trim()) return value.trim();
+        if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+    }
+    return '';
+}
+
+function eachShareMeta(payload, callback) {
+    if (!payload || typeof payload !== 'object' || !payload.meta || typeof payload.meta !== 'object') return;
+    Object.values(payload.meta).forEach(item => {
+        if (item && typeof item === 'object') callback(item);
+    });
+}
+
+function detectSharePlatformFromUrl(url) {
+    if (!url) return '';
+    const value = String(url).toLowerCase();
+    const patterns = [
+        [/bilibili\.com|b23\.tv|bili2233\.cn/, '哔哩哔哩'],
+        [/music\.163\.com|y\.music\.163\.com/, '网易云音乐'],
+        [/y\.qq\.com|c6\.y\.qq\.com|i\.y\.qq\.com/, 'QQ音乐'],
+        [/douyin\.com|iesdouyin\.com/, '抖音'],
+        [/kuaishou\.com|gifshow\.com/, '快手'],
+        [/xiaohongshu\.com|xhslink\.com/, '小红书'],
+        [/weibo\.com|weibo\.cn/, '微博'],
+        [/zhihu\.com/, '知乎'],
+        [/github\.com/, 'GitHub'],
+        [/mp\.weixin\.qq\.com/, '微信文章'],
+        [/acfun\.cn/, 'AcFun']
+    ];
+    const match = patterns.find(([reg]) => reg.test(value));
+    return match ? match[1] : '';
+}
+
+function getCqJsonShareInfo(data) {
+    const payload = parseCqJsonData(data);
+    const decodedData = decodeCqJsonData(data);
+    if (!payload) {
+        const tag = getJsonFieldFromText(decodedData, 'tag');
+        const source = getJsonFieldFromText(decodedData, 'source');
+        const sourceName = getJsonFieldFromText(decodedData, 'source_name');
+        const metaTitle = getJsonFieldFromText(decodedData, 'title');
+        const metaDesc = getJsonFieldFromText(decodedData, 'desc');
+        const prompt = getJsonFieldFromText(decodedData, 'prompt');
+        const urls = ['qqdocurl', 'jumpUrl', 'url', 'source_url'].map(key => getJsonFieldFromText(decodedData, key));
+        const platform = firstText(tag, source, sourceName, urls.map(detectSharePlatformFromUrl).find(Boolean), metaTitle, prompt.match(/^\[([^\]]+)\]/)?.[1], '链接分享');
+        const title = (metaTitle && metaTitle !== platform ? metaTitle : metaDesc) || prompt.replace(/^\[[^\]]+\]\s*/, '');
+        return { platform, title };
+    }
+
+    let platform = '';
+    let title = '';
+    let metaTitle = '';
+    let metaDesc = '';
+    const urls = [];
+
+    eachShareMeta(payload, item => {
+        platform = platform || firstText(item.tag, item.source, item.source_name);
+        metaTitle = metaTitle || firstText(item.title);
+        metaDesc = metaDesc || firstText(item.desc);
+        ['qqdocurl', 'jumpUrl', 'url', 'source_url', 'preview'].forEach(key => {
+            if (item[key]) urls.push(item[key]);
+        });
+    });
+
+    const promptPlatform = firstText(payload.prompt).match(/^\[([^\]]+)\]/)?.[1] || '';
+    platform = platform || urls.map(detectSharePlatformFromUrl).find(Boolean) || metaTitle || promptPlatform || firstText(payload.app);
+    title = (metaTitle && metaTitle !== platform ? metaTitle : metaDesc) || firstText(payload.prompt).replace(/^\[[^\]]+\]\s*/, '') || firstText(payload.desc);
+
+    return {
+        platform: platform || '链接分享',
+        title
+    };
+}
+
+function formatSharePreview(data) {
+    const info = getCqJsonShareInfo(data);
+    return info.title ? `[${info.platform}] ${info.title}` : `[${info.platform}]`;
+}
+
+function isShareJsonPayload(text) {
+    const payload = parseCqJsonData(text);
+    return Boolean(payload && typeof payload === 'object' && payload.meta && payload.app);
 }
 
 function debounceMemberSearch(value) {
@@ -265,8 +482,23 @@ function formatMsg(text) {
         }
     }
 
+    const shareCards = [];
+    const makeSharePlaceholder = data => {
+        const info = getCqJsonShareInfo(data);
+        const safePlatform = escapeAttr(info.platform);
+        const safeTitle = escapeAttr(info.title);
+        const titleHtml = safeTitle ? `<span class="msg-share-title">${safeTitle}</span>` : '';
+        const index = shareCards.length;
+        shareCards.push(`<span class="msg-share-card"><span class="msg-share-platform">🔗 ${safePlatform}</span>${titleHtml}</span>`);
+        return `__CQ_JSON_SHARE_${index}__`;
+    };
+
+    const textWithSharePlaceholders = isShareJsonPayload(String(text).trim())
+        ? makeSharePlaceholder(String(text).trim())
+        : replaceCqJsonCodes(text, makeSharePlaceholder);
+
     const div = document.createElement('div');
-    div.innerText = text;
+    div.innerText = textWithSharePlaceholders;
     let escaped = div.innerHTML;
 
     function isSafeUrl(url) {
@@ -284,6 +516,10 @@ function formatMsg(text) {
     }
 
     // CQ Code Handling
+    shareCards.forEach((html, index) => {
+        escaped = escaped.replace(`__CQ_JSON_SHARE_${index}__`, html);
+    });
+
     // Images
     escaped = escaped.replace(/\[CQ:image,([^\]]+)\]/g, (match, inner) => {
         const urlMatch = inner.match(/url=([^,\]]+)/);

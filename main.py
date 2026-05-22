@@ -367,7 +367,7 @@ class ArchiveGetContextMessagesTool(FunctionTool[AstrAgentContext]):
         )
 
 
-@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天记录存档插件", "v1.2")
+@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天消息存档插件", "v1.2.1")
 class ChatArchivePlugin(Star):
     # Batch writer configuration
     _BATCH_SIZE = 50
@@ -779,6 +779,17 @@ class ChatArchivePlugin(Star):
                 elif cls_name == "Reply":
                     rid = getattr(comp, "id", "")
                     parts.append(f"[CQ:reply,id={rid}]")
+                elif cls_name.lower() == "json":
+                    data = getattr(comp, "data", "") or getattr(comp, "text", "")
+                    if not isinstance(data, str):
+                        data = json.dumps(data, ensure_ascii=False, default=str)
+                    escaped_data = (
+                        data.replace("&", "&amp;")
+                        .replace("[", "&#91;")
+                        .replace("]", "&#93;")
+                        .replace(",", "&#44;")
+                    )
+                    parts.append(f"[CQ:json,data={escaped_data}]")
                 elif cls_name in ("Forward", "Node", "Nodes"):
                     parts.append("[合并转发]")
                 elif cls_name == "File":
