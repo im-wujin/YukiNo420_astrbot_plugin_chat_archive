@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import datetime
 import json
@@ -367,7 +369,7 @@ class ArchiveGetContextMessagesTool(FunctionTool[AstrAgentContext]):
         )
 
 
-@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天消息存档插件", "v1.2.1")
+@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天消息存档插件", "v1.2.2")
 class ChatArchivePlugin(Star):
     # Batch writer configuration
     _BATCH_SIZE = 50
@@ -379,6 +381,8 @@ class ChatArchivePlugin(Star):
 
         self._shutting_down = False
         self._download_locks: dict[str, asyncio.Lock] = {}
+        self._download_lock_refs: dict[str, int] = {}
+        self._download_locks_guard = asyncio.Lock()
 
         # Track active background tasks to avoid garbage collection and 'Task was destroyed but it is pending' errors
         self._background_tasks = set()
@@ -617,7 +621,7 @@ class ChatArchivePlugin(Star):
             except asyncio.QueueEmpty:
                 break
         if remaining:
-            self._flush_batch_sync(remaining)
+            self._flush_batches_sync(remaining)
 
         if self.web_server:
             await self.web_server.stop()
@@ -672,7 +676,7 @@ class ChatArchivePlugin(Star):
                         break
                 if buffer:
                     try:
-                        self._flush_batch_sync(buffer)
+                        self._flush_batches_sync(buffer)
                     except Exception as e:
                         logger.error(f"Chat Archive: final flush error: {e}")
                 break
@@ -693,6 +697,11 @@ class ChatArchivePlugin(Star):
             logger.error(f"Chat Archive: {len(batch)} 条写入失败记录已保存到 {failed_path}")
         except Exception as e:
             logger.error(f"Chat Archive: 保存失败写入记录也失败了: {e}")
+
+    def _flush_batches_sync(self, records: list[tuple]):
+        """Flush records in bounded chunks to avoid long SQLite write locks."""
+        for start in range(0, len(records), self._BATCH_SIZE):
+            self._flush_batch_sync(records[start:start + self._BATCH_SIZE])
 
     def _flush_batch_sync(self, batch: list[tuple]):
         """Flush a batch of messages to the database (runs in thread)."""
@@ -752,6 +761,7 @@ class ChatArchivePlugin(Star):
                 elif cls_name == "Image":
                     url = getattr(comp, "url", "") or getattr(comp, "file", "")
                     if url:
+                        url = ChatArchivePlugin._escape_cq_param(url)
                         width = ChatArchivePlugin._positive_int(getattr(comp, "width", 0))
                         height = ChatArchivePlugin._positive_int(getattr(comp, "height", 0))
                         dim_str = f",width={width},height={height}" if width and height else ""
@@ -761,12 +771,14 @@ class ChatArchivePlugin(Star):
                 elif cls_name == "Video":
                     url = getattr(comp, "file", "") or getattr(comp, "url", "")
                     if url:
+                        url = ChatArchivePlugin._escape_cq_param(url)
                         parts.append(f"[CQ:video,url={url}]")
                     else:
                         parts.append("[CQ:video]")
                 elif cls_name == "Record":
                     url = getattr(comp, "url", "") or getattr(comp, "file", "")
                     if url:
+                        url = ChatArchivePlugin._escape_cq_param(url)
                         parts.append(f"[CQ:record,url={url}]")
                     else:
                         parts.append("[语音]")
@@ -783,12 +795,7 @@ class ChatArchivePlugin(Star):
                     data = getattr(comp, "data", "") or getattr(comp, "text", "")
                     if not isinstance(data, str):
                         data = json.dumps(data, ensure_ascii=False, default=str)
-                    escaped_data = (
-                        data.replace("&", "&amp;")
-                        .replace("[", "&#91;")
-                        .replace("]", "&#93;")
-                        .replace(",", "&#44;")
-                    )
+                    escaped_data = ChatArchivePlugin._escape_cq_param(data)
                     parts.append(f"[CQ:json,data={escaped_data}]")
                 elif cls_name in ("Forward", "Node", "Nodes"):
                     parts.append("[合并转发]")
@@ -804,6 +811,17 @@ class ChatArchivePlugin(Star):
             except Exception as e:
                 logger.debug(f"Chat Archive: failed to serialize {cls_name}: {e}")
         return "".join(parts)
+
+    @staticmethod
+    def _escape_cq_param(value) -> str:
+        """Escape CQ parameter separators so stored media URLs remain parseable."""
+        return (
+            str(value)
+            .replace("&", "&amp;")
+            .replace("[", "&#91;")
+            .replace("]", "&#93;")
+            .replace(",", "&#44;")
+        )
 
     @staticmethod
     def _positive_int(value) -> int:
@@ -1004,118 +1022,131 @@ class ChatArchivePlugin(Star):
         # Generate filename
         # Compute MD5 hash of URL
         url_hash = hashlib.md5(url.encode("utf-8")).hexdigest()
-        
-        if url_hash not in self._download_locks:
-            self._download_locks[url_hash] = asyncio.Lock()
-            
-        async with self._download_locks[url_hash]:
-            # Try to guess extension from URL
-            ext = ""
-            url_lower = url.lower()
-            if ".png" in url_lower:
-                ext = ".png"
-            elif ".gif" in url_lower:
-                ext = ".gif"
-            elif ".webp" in url_lower:
-                ext = ".webp"
-            elif ".jpg" in url_lower or ".jpeg" in url_lower:
-                ext = ".jpg"
-            elif ".mp4" in url_lower:
-                ext = ".mp4"
-            elif ".webm" in url_lower:
-                ext = ".webm"
-            elif ".avi" in url_lower:
-                ext = ".avi"
-            elif ".mkv" in url_lower:
-                ext = ".mkv"
-            
-            # Default fallback if extension not found
-            if not ext:
-                if "video" in url_lower:
-                    ext = ".mp4"
-                else:
+
+        async with self._download_locks_guard:
+            download_lock = self._download_locks.get(url_hash)
+            if download_lock is None:
+                download_lock = asyncio.Lock()
+                self._download_locks[url_hash] = download_lock
+            self._download_lock_refs[url_hash] = self._download_lock_refs.get(url_hash, 0) + 1
+
+        try:
+            async with download_lock:
+                # Try to guess extension from URL
+                ext = ""
+                url_lower = url.lower()
+                if ".png" in url_lower:
+                    ext = ".png"
+                elif ".gif" in url_lower:
+                    ext = ".gif"
+                elif ".webp" in url_lower:
+                    ext = ".webp"
+                elif ".jpg" in url_lower or ".jpeg" in url_lower:
                     ext = ".jpg"
-                    
-            filename = f"{url_hash}{ext}"
-            dest_path = STATIC_CACHE_DIR / filename
-            relative_url = f"/static/cache/{filename}"
+                elif ".mp4" in url_lower:
+                    ext = ".mp4"
+                elif ".webm" in url_lower:
+                    ext = ".webm"
+                elif ".avi" in url_lower:
+                    ext = ".avi"
+                elif ".mkv" in url_lower:
+                    ext = ".mkv"
 
-            # If already exists, return local path directly
-            if dest_path.exists():
-                return relative_url
+                # Default fallback if extension not found
+                if not ext:
+                    if "video" in url_lower:
+                        ext = ".mp4"
+                    else:
+                        ext = ".jpg"
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
-                "Referer": "https://q.qq.com/",
-            }
+                filename = f"{url_hash}{ext}"
+                dest_path = STATIC_CACHE_DIR / filename
+                relative_url = f"/static/cache/{filename}"
 
-            try:
-                # Do not follow redirects automatically; a redirect could jump to a non-allowlisted/internal host.
-                async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
-                    async with client.stream("GET", url, headers=headers) as response:
-                        if response.status_code != 200:
-                            logger.warning(f"Chat Archive: 下载媒体失败 {url}, 状态码 {response.status_code}")
-                            return url
+                # If already exists, return local path directly
+                if dest_path.exists():
+                    return relative_url
 
-                        content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
-                        if not (content_type.startswith("image/") or content_type.startswith("video/")):
-                            logger.warning(f"Chat Archive: 拒绝缓存非图片/视频响应 {url}, content-type={content_type or 'unknown'}")
-                            return url
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36",
+                    "Referer": "https://q.qq.com/",
+                }
 
-                        content_length = response.headers.get("content-length")
-                        if content_length:
+                try:
+                    # Do not follow redirects automatically; a redirect could jump to a non-allowlisted/internal host.
+                    async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
+                        async with client.stream("GET", url, headers=headers) as response:
+                            if response.status_code != 200:
+                                logger.warning(f"Chat Archive: 下载媒体失败 {url}, 状态码 {response.status_code}")
+                                return url
+
+                            content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+                            if not (content_type.startswith("image/") or content_type.startswith("video/")):
+                                logger.warning(f"Chat Archive: 拒绝缓存非图片/视频响应 {url}, content-type={content_type or 'unknown'}")
+                                return url
+
+                            content_length = response.headers.get("content-length")
+                            if content_length:
+                                try:
+                                    if int(content_length) > max_media_bytes:
+                                        logger.warning(f"Chat Archive: 拒绝缓存超大媒体 {url}, size={content_length}")
+                                        return url
+                                except ValueError:
+                                    pass
+
+                            # Refine extension based on content-type.
+                            new_ext = ""
+                            if content_type == "image/png":
+                                new_ext = ".png"
+                            elif content_type == "image/gif":
+                                new_ext = ".gif"
+                            elif content_type == "image/webp":
+                                new_ext = ".webp"
+                            elif content_type in ("image/jpeg", "image/jpg"):
+                                new_ext = ".jpg"
+                            elif content_type == "video/mp4":
+                                new_ext = ".mp4"
+                            elif content_type == "video/webm":
+                                new_ext = ".webm"
+
+                            if new_ext:
+                                filename = f"{url_hash}{new_ext}"
+                                dest_path = STATIC_CACHE_DIR / filename
+                                relative_url = f"/static/cache/{filename}"
+                                if dest_path.exists():
+                                    return relative_url
+
+                            # Write to temp file first to avoid corrupted/partial file cache on interrupted downloads.
+                            temp_path = dest_path.with_suffix(".tmp")
+                            downloaded = 0
                             try:
-                                if int(content_length) > max_media_bytes:
-                                    logger.warning(f"Chat Archive: 拒绝缓存超大媒体 {url}, size={content_length}")
-                                    return url
-                            except ValueError:
-                                pass
-
-                        # Refine extension based on content-type.
-                        new_ext = ""
-                        if content_type == "image/png":
-                            new_ext = ".png"
-                        elif content_type == "image/gif":
-                            new_ext = ".gif"
-                        elif content_type == "image/webp":
-                            new_ext = ".webp"
-                        elif content_type in ("image/jpeg", "image/jpg"):
-                            new_ext = ".jpg"
-                        elif content_type == "video/mp4":
-                            new_ext = ".mp4"
-                        elif content_type == "video/webm":
-                            new_ext = ".webm"
-
-                        if new_ext:
-                            filename = f"{url_hash}{new_ext}"
-                            dest_path = STATIC_CACHE_DIR / filename
-                            relative_url = f"/static/cache/{filename}"
-                            if dest_path.exists():
-                                return relative_url
-
-                        # Write to temp file first to avoid corrupted/partial file cache on interrupted downloads.
-                        temp_path = dest_path.with_suffix(".tmp")
-                        downloaded = 0
-                        try:
-                            with open(temp_path, "wb") as f:
-                                async for chunk in response.aiter_bytes():
-                                    downloaded += len(chunk)
-                                    if downloaded > max_media_bytes:
-                                        raise ValueError(f"media too large: {downloaded} bytes")
-                                    f.write(chunk)
-                            temp_path.rename(dest_path)
-                        except Exception:
-                            try:
-                                temp_path.unlink(missing_ok=True)
+                                with open(temp_path, "wb") as f:
+                                    async for chunk in response.aiter_bytes():
+                                        downloaded += len(chunk)
+                                        if downloaded > max_media_bytes:
+                                            raise ValueError(f"media too large: {downloaded} bytes")
+                                        f.write(chunk)
+                                temp_path.rename(dest_path)
                             except Exception:
-                                pass
-                            raise
-                        logger.info(f"Chat Archive: 成功缓存媒体到 {dest_path}")
-                        return relative_url
-            except Exception as e:
-                logger.error(f"Chat Archive: 下载媒体异常 {url}: {e}")
-                
-            return url
+                                try:
+                                    temp_path.unlink(missing_ok=True)
+                                except Exception:
+                                    pass
+                                raise
+                            logger.info(f"Chat Archive: 成功缓存媒体到 {dest_path}")
+                            return relative_url
+                except Exception as e:
+                    logger.error(f"Chat Archive: 下载媒体异常 {url}: {e}")
+
+                return url
+        finally:
+            async with self._download_locks_guard:
+                refs = self._download_lock_refs.get(url_hash, 0) - 1
+                if refs <= 0:
+                    self._download_lock_refs.pop(url_hash, None)
+                    self._download_locks.pop(url_hash, None)
+                else:
+                    self._download_lock_refs[url_hash] = refs
 
     async def _replace_cq_media_url(self, match) -> str:
         cq_type = match.group(1)  # 'image' or 'video'
@@ -1125,7 +1156,12 @@ class ChatArchivePlugin(Star):
         if url_match:
             original_url = url_match.group(1)
             # Decode potential XML/HTML entities in URL
-            url = original_url.replace("&amp;", "&").replace("&#44;", ",")
+            url = (
+                original_url.replace("&amp;", "&")
+                .replace("&#44;", ",")
+                .replace("&#91;", "[")
+                .replace("&#93;", "]")
+            )
             cached_url = await self._download_media_to_cache(url)
             # Replace the original url with cached url in the CQ code
             new_inner = inner.replace(original_url, cached_url)

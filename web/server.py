@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import datetime
 import json
@@ -19,12 +21,12 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 try:
-    from ..db_config import get_db_connection
+    from ..db_config import get_db_connection, init_db
 except ImportError:
     try:
         import sys
         sys.path.append(str(Path(__file__).resolve().parent.parent))
-        from db_config import get_db_connection
+        from db_config import get_db_connection, init_db
     except Exception:
         raise RuntimeError("无法加载 db_config 模块。如果是独立解耦运行，请使用 'python -m astrbot_plugin_chat_archive.web.server' 从 AstrBot 的 plugins 目录执行。")
 
@@ -212,6 +214,12 @@ def load_right_align_ids():
 
 app = FastAPI(title="Chat Archive Admin Panel")
 
+
+@app.on_event("startup")
+async def startup_init_db():
+    """Ensure standalone WebUI runs with the latest database schema."""
+    await asyncio.to_thread(init_db)
+
 current_dir = Path(__file__).resolve().parent
 static_dir = current_dir / "static"
 templates_dir = current_dir / "templates"
@@ -273,10 +281,16 @@ async def index(request: Request):
 
 @app.post("/api/auth/verify")
 async def verify_auth(request: Request):
-    data = await request.json()
-    provided_key = data.get("api_key", "").strip()
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    provided_key = str(data.get("api_key", "")).strip()
     if not API_KEY:
-        return JSONResponse(content={"success": True, "message": "No auth required"})
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "message": "API Key is not configured"},
+        )
     if provided_key and secrets.compare_digest(provided_key, API_KEY):
         resp = JSONResponse(content={"success": True})
         resp.set_cookie(
@@ -311,6 +325,7 @@ def get_history(
     page: int = Query(1, ge=1, le=100000),
     limit: int = Query(50, ge=1, le=200),
     cursor: int = Query(0, ge=0),
+    include_total: bool = Query(False),
 ):
     db = None
     try:
@@ -370,9 +385,28 @@ def get_history(
             next_cursor = 0
             has_more = False
 
-        # Fetch total count
-        count_query = f"SELECT COUNT(*) as total FROM chat_history {where_cl}"
-        total = db.execute(count_query, params).fetchone()["total"]
+        # Exact COUNT(*) can dominate latency on large archives. Keep the legacy
+        # `total` field, but only compute it when explicitly requested. For the
+        # common unfiltered session view, use session_stats as a cheap compatible
+        # estimate that is exact for append-only history.
+        total = None
+        total_exact = False
+        if include_total:
+            count_query = f"SELECT COUNT(*) as total FROM chat_history {where_cl}"
+            total = db.execute(count_query, params).fetchone()["total"]
+            total_exact = True
+        elif session_id and not keyword and not user_id and not time_start and not time_end:
+            stats_id = "legacy:archive" if session_id == "legacy:archive" else str(session_id)
+            try:
+                row = db.execute(
+                    "SELECT message_count FROM session_stats WHERE session_id = ?",
+                    [stats_id],
+                ).fetchone()
+                if row:
+                    total = row["message_count"]
+                    total_exact = True
+            except Exception:
+                total = None
 
         right_ids = load_right_align_ids()
         processed_records = []
@@ -403,6 +437,7 @@ def get_history(
                 "limit": limit,
                 "next_cursor": next_cursor,
                 "has_more": has_more,
+                "total_exact": total_exact,
             }
         )
     except Exception as e:
@@ -498,21 +533,37 @@ def get_sessions():
     try:
         db = get_db_connection()
         query = """
-            SELECT COALESCE(session_id, 'legacy:archive') as session_id,
+            SELECT session_id,
                    COALESCE(message_type, 'legacy') as message_type,
-                   timestamp as last_time,
-                   message as last_msg,
+                   last_time,
+                   last_msg,
                    sender_name,
-                   session_name
-            FROM chat_history
-            WHERE id IN (
-                SELECT MAX(id)
-                FROM chat_history
-                GROUP BY COALESCE(session_id, 'legacy:archive')
-            )
+                   session_name,
+                   message_count as count
+            FROM session_stats
             ORDER BY last_time DESC
         """
-        sessions = db.execute(query).fetchall()
+        try:
+            sessions = db.execute(query).fetchall()
+        except Exception:
+            # Fallback for old databases or external callers that have not run init_db.
+            query = """
+                SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive') as session_id,
+                       COALESCE(message_type, 'legacy') as message_type,
+                       timestamp as last_time,
+                       message as last_msg,
+                       sender_name,
+                       session_name,
+                       0 as count
+                FROM chat_history
+                WHERE id IN (
+                    SELECT MAX(id)
+                    FROM chat_history
+                    GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+                )
+                ORDER BY last_time DESC
+            """
+            sessions = db.execute(query).fetchall()
 
         for s in sessions:
             s_id = s["session_id"]
@@ -612,7 +663,8 @@ def get_stats(
             WITH filtered AS (
                 SELECT id, user_id, sender_name, timestamp
                 FROM chat_history {where_cl}
-                AND user_id IS NOT NULL AND user_id != ''
+                AND user_id IS NOT NULL AND user_id != '' AND user_id != '0'
+                AND (is_recalled IS NULL OR is_recalled = 0)
             )
             SELECT grouped.user_id,
                    COALESCE(
@@ -705,7 +757,12 @@ def get_members(
     try:
         db = get_db_connection()
 
-        conditions = ["user_id IS NOT NULL", "user_id != ''"]
+        conditions = [
+            "user_id IS NOT NULL",
+            "user_id != ''",
+            "user_id != '0'",
+            "(is_recalled IS NULL OR is_recalled = 0)",
+        ]
         params = []
         if session_id == "legacy:archive":
             conditions.append(

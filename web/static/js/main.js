@@ -45,6 +45,10 @@ let filterStart = 0;
 let filterEnd = 0;
 let activeMsgType = '';
 
+function isFriendSessionType(type = activeMsgType) {
+    return safeText(type).toLowerCase().includes('friend');
+}
+
 function getInitialMemberLimit() {
     const height = window.innerHeight || document.documentElement.clientHeight || 900;
     const estimated = Math.ceil((height - 180) / 74);
@@ -343,6 +347,15 @@ function parseCqJsonData(data) {
     }
 }
 
+function decodeCqParamValue(value) {
+    if (!value) return '';
+    return String(value)
+        .replace(/&amp;/g, '&')
+        .replace(/&#44;/g, ',')
+        .replace(/&#91;/g, '[')
+        .replace(/&#93;/g, ']');
+}
+
 function getJsonFieldFromText(text, field) {
     if (!text) return '';
     const reg = new RegExp(`"${field}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
@@ -524,7 +537,7 @@ function formatMsg(text) {
     escaped = escaped.replace(/\[CQ:image,([^\]]+)\]/g, (match, inner) => {
         const urlMatch = inner.match(/url=([^,\]]+)/);
         if (urlMatch && urlMatch[1]) {
-            let url = urlMatch[1].replace(/&amp;/g, '&').replace(/&#44;/g, ',');
+            let url = decodeCqParamValue(urlMatch[1]);
             url = proxyUrl(url);
             if (!isSafeUrl(url)) return `<span class="msg-tag">🖼️ [图片]</span>`;
             const safeUrl = escapeAttr(url);
@@ -548,7 +561,7 @@ function formatMsg(text) {
     escaped = escaped.replace(/\[CQ:video,([^\]]+)\]/g, (match, inner) => {
         const urlMatch = inner.match(/url=([^,\]]+)/);
         if (urlMatch && urlMatch[1]) {
-            let url = urlMatch[1].replace(/&amp;/g, '&').replace(/&#44;/g, ',');
+            let url = decodeCqParamValue(urlMatch[1]);
             url = proxyUrl(url);
             if (!isSafeUrl(url)) return `<span class="msg-tag">🎬 [视频]</span>`;
             const safeUrl = escapeAttr(url);
@@ -561,7 +574,7 @@ function formatMsg(text) {
     escaped = escaped.replace(/\[CQ:record,([^\]]+)\]/g, (match, inner) => {
         const urlMatch = inner.match(/url=([^,\]]+)/);
         if (urlMatch && urlMatch[1]) {
-            let url = urlMatch[1].replace(/&amp;/g, '&').replace(/&#44;/g, ',');
+            let url = decodeCqParamValue(urlMatch[1]);
             url = proxyUrl(url);
             if (!isSafeUrl(url)) return `<span class="msg-tag">🎙️ [语音]</span>`;
             const safeUrl = escapeAttr(url);
@@ -883,7 +896,7 @@ async function selectSession(sessionId, name, msgType) {
     window.userMap = {};
 
     const activeItem = document.querySelector(`.session-item[data-session-id="${CSS.escape(sessionId)}"]`);
-    if (activeItem && activeMsgType !== 'friend') {
+    if (activeItem && !isFriendSessionType()) {
         const subMenu = document.createElement('div');
         subMenu.className = 'sidebar-sub-menu';
 
@@ -920,6 +933,7 @@ function renderUserList(users = sidebarMemberUsers) {
         window.userMap[u.user_id] = u.sender_name;
         const subItem = document.createElement('div');
         subItem.className = `sub-menu-item ${activeUserId === u.user_id ? 'active' : ''}`;
+        subItem.dataset.userId = safeText(u.user_id);
         const wrap = document.createElement('span');
         wrap.style.cssText = 'display:flex; align-items:center; gap:0.4rem; overflow:hidden;';
         const avatar = document.createElement('img');
@@ -977,7 +991,7 @@ function renderUserList(users = sidebarMemberUsers) {
 }
 
 async function fetchMembers({ target = 'both', keyword = '', offset = 0, append = false, limit = null } = {}) {
-    if (!activeSessionId || activeMsgType === 'friend') return;
+    if (!activeSessionId || isFriendSessionType()) return;
     const updateSidebar = target === 'sidebar' || target === 'both';
     const updateRank = target === 'rank' || target === 'both';
     const sidebarSeq = updateSidebar ? ++memberRequestSeq : memberRequestSeq;
@@ -1039,7 +1053,7 @@ function scheduleAnalysisMemberAutofill() {
 }
 
 function autofillAnalysisMembers() {
-    if (!rankHasMore || activeUserId || activeMsgType === 'friend') return;
+    if (!rankHasMore || activeUserId || isFriendSessionType()) return;
 
     const content = document.getElementById('analysisContent');
     const list = document.getElementById('rankList');
@@ -1096,10 +1110,9 @@ function attachRankItemHandlers(root = document) {
             const nextUserId = item.getAttribute('data-user-id');
             if (!nextUserId) return;
             activeUserId = nextUserId;
-            const uname = item.dataset.userName || '';
 
             document.querySelectorAll('.sub-menu-item').forEach(el => {
-                if (el.innerText.includes(uname)) el.classList.add('active');
+                if (el.dataset.userId === nextUserId) el.classList.add('active');
                 else el.classList.remove('active');
             });
             reloadStats();
@@ -1152,7 +1165,7 @@ async function reloadStats() {
     try {
         let qs = `/api/stats?session_id=${encodeURIComponent(activeSessionId)}`;
         if (activeUserId) qs += `&user_id=${encodeURIComponent(activeUserId)}`;
-        if (activeMsgType === 'friend') qs += `&is_private=1`;
+        if (isFriendSessionType()) qs += `&is_private=1`;
         if (filterStart) qs += `&time_start=${filterStart}`;
         if (filterEnd) qs += `&time_end=${filterEnd}`;
 
@@ -1344,6 +1357,29 @@ function stabilizePrependAnchor(list, anchorEl, anchorTop, attempts = 5) {
     requestAnimationFrame(() => stabilizePrependAnchor(list, anchorEl, anchorTop, attempts - 1));
 }
 
+const MAX_RENDERED_MESSAGE_BLOCKS = 700;
+
+function pruneMessageDom(list, removeFromBottom = false) {
+    const blocks = Array.from(list.querySelectorAll('.message-group, .msg-system-center, .date-divider'));
+    const overflow = blocks.length - MAX_RENDERED_MESSAGE_BLOCKS;
+    if (overflow <= 0) return;
+
+    const victims = removeFromBottom ? blocks.slice(-overflow) : blocks.slice(0, overflow);
+    let removedAboveHeight = 0;
+    const listTop = list.getBoundingClientRect().top;
+
+    victims.forEach(el => {
+        if (!removeFromBottom) {
+            const rect = el.getBoundingClientRect();
+            if (rect.bottom <= listTop) removedAboveHeight += rect.height;
+        }
+        el.remove();
+    });
+
+    // If we remove nodes above the viewport, compensate to avoid visible jumps.
+    if (removedAboveHeight > 0) list.scrollTop -= removedAboveHeight;
+}
+
 // 监听容器高度变化（如图片加载），自动保持底部
 const listObserver = new ResizeObserver(entries => {
     const list = document.getElementById('messageList');
@@ -1474,6 +1510,7 @@ async function fetchHistory(append = false) {
                     list.appendChild(fragment);
                 }
                 loadMoreEl.style.display = hasMore ? 'block' : 'none';
+                pruneMessageDom(list, true);
                 stabilizePrependAnchor(list, anchorEl, anchorTop);
             } else {
                 loadMoreEl.style.display = hasMore ? 'block' : 'none';
@@ -1488,6 +1525,8 @@ async function fetchHistory(append = false) {
                 } else {
                     list.appendChild(anchor); // 移到最后
                 }
+
+                pruneMessageDom(list, false);
 
                 // 立即滚动
                 scrollListToBottom(list);
@@ -1520,13 +1559,21 @@ function handleSearch() {
 const viewport = document.getElementById('messageList');
 const scrollBtn = document.getElementById('scrollToBottomBtn');
 
-viewport.onscroll = () => {
-    if (viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 500) {
-        scrollBtn.style.display = 'flex';
-    } else {
-        scrollBtn.style.display = 'none';
-    }
-};
+let scrollTicking = false;
+let scrollBtnVisible = false;
+
+viewport.addEventListener('scroll', () => {
+    if (scrollTicking) return;
+    scrollTicking = true;
+    requestAnimationFrame(() => {
+        const shouldShow = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight > 500;
+        if (shouldShow !== scrollBtnVisible) {
+            scrollBtnVisible = shouldShow;
+            scrollBtn.style.display = shouldShow ? 'flex' : 'none';
+        }
+        scrollTicking = false;
+    });
+}, { passive: true });
 
 scrollBtn.onclick = () => {
     viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' });

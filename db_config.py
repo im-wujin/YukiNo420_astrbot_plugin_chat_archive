@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import sqlite3
 import os
 import json
@@ -361,12 +363,20 @@ class DatabaseManager:
     def get_sessions() -> list[dict]:
         try:
             with get_db_connection() as conn:
-                cursor = conn.execute(
-                    "SELECT session_id, message_type, COUNT(*) as count, "
-                    "MAX(timestamp) as last_time "
-                    "FROM chat_history GROUP BY session_id "
-                    "ORDER BY last_time DESC"
-                )
+                try:
+                    cursor = conn.execute(
+                        "SELECT session_id, message_type, message_count as count, "
+                        "last_time FROM session_stats ORDER BY last_time DESC"
+                    )
+                except Exception:
+                    # Forward-compatible fallback for databases that have not run init_db yet.
+                    cursor = conn.execute(
+                        "SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive') as session_id, "
+                        "COALESCE(message_type, 'legacy') as message_type, COUNT(*) as count, "
+                        "MAX(timestamp) as last_time "
+                        "FROM chat_history GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive') "
+                        "ORDER BY last_time DESC"
+                    )
                 return [dict(row) for row in cursor.fetchall()]
         except Exception as e:
             logger.error(f"Chat Archive API get_sessions error: {e}")
@@ -386,7 +396,9 @@ class DatabaseManager:
             with get_db_connection() as conn:
                 query = (
                     "SELECT user_id, sender_name, COUNT(*) as count "
-                    "FROM chat_history WHERE session_id = ?"
+                    "FROM chat_history WHERE session_id = ? "
+                    "AND user_id IS NOT NULL AND user_id != '' AND user_id != '0' "
+                    "AND (is_recalled IS NULL OR is_recalled = 0)"
                 )
                 params: list = [str(session_id)]
 
@@ -493,9 +505,10 @@ class DatabaseManager:
             session_id=session_id,
             user_id=user_id,
             limit=limit,
-            asc=True,
+            asc=False,
             exclude_recalled=exclude_recalled,
         )
+        records.reverse()
         result = []
         for msg in records:
             ts = msg.get("timestamp", 0)
@@ -640,6 +653,100 @@ def migrate_v4(db):
     if not column_exists(db, "chat_history", "is_recalled"):
         db.execute("ALTER TABLE chat_history ADD COLUMN is_recalled INTEGER DEFAULT 0;")
 
+def ensure_session_stats(db):
+    """Create and backfill a session summary table without changing chat_history."""
+    db.execute('''CREATE TABLE IF NOT EXISTS session_stats (
+        session_id TEXT PRIMARY KEY,
+        message_type TEXT,
+        session_name TEXT,
+        last_msg TEXT,
+        sender_name TEXT,
+        last_time INTEGER,
+        last_message_id INTEGER,
+        message_count INTEGER DEFAULT 0
+    )''')
+    db.execute("CREATE INDEX IF NOT EXISTS idx_session_stats_last_time ON session_stats(last_time DESC);")
+
+    # Keep stats current for new writes. Existing installations are backfilled below.
+    db.execute("DROP TRIGGER IF EXISTS trg_chat_history_session_stats_insert;")
+    db.execute('''CREATE TRIGGER trg_chat_history_session_stats_insert
+    AFTER INSERT ON chat_history
+    BEGIN
+        INSERT INTO session_stats (
+            session_id, message_type, session_name, last_msg, sender_name,
+            last_time, last_message_id, message_count
+        ) VALUES (
+            COALESCE(NULLIF(NEW.session_id, ''), 'legacy:archive'),
+            COALESCE(NEW.message_type, 'legacy'),
+            NEW.session_name,
+            NEW.message,
+            NEW.sender_name,
+            NEW.timestamp,
+            NEW.id,
+            1
+        )
+        ON CONFLICT(session_id) DO UPDATE SET
+            message_count = session_stats.message_count + 1,
+            message_type = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.message_type
+                ELSE session_stats.message_type
+            END,
+            session_name = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.session_name
+                ELSE session_stats.session_name
+            END,
+            last_msg = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.last_msg
+                ELSE session_stats.last_msg
+            END,
+            sender_name = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.sender_name
+                ELSE session_stats.sender_name
+            END,
+            last_time = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.last_time
+                ELSE session_stats.last_time
+            END,
+            last_message_id = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.last_message_id
+                ELSE session_stats.last_message_id
+            END;
+    END;''')
+
+    row = db.execute("SELECT COUNT(*) as cnt FROM session_stats;").fetchone()
+    if row and row["cnt"] == 0:
+        db.execute('''INSERT OR REPLACE INTO session_stats (
+                session_id, message_type, session_name, last_msg, sender_name,
+                last_time, last_message_id, message_count
+            )
+            SELECT latest.session_id,
+                   COALESCE(latest.message_type, 'legacy') as message_type,
+                   latest.session_name,
+                   latest.message as last_msg,
+                   latest.sender_name,
+                   latest.timestamp as last_time,
+                   latest.id as last_message_id,
+                   counts.message_count
+            FROM (
+                SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive') as session_id,
+                       COUNT(*) as message_count
+                FROM chat_history
+                GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+            ) counts
+            JOIN (
+                SELECT COALESCE(NULLIF(ch.session_id, ''), 'legacy:archive') as session_id,
+                       ch.message_type, ch.session_name, ch.message, ch.sender_name,
+                       ch.timestamp, ch.id
+                FROM chat_history ch
+                JOIN (
+                    SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive') as session_id,
+                           MAX(id) as max_id
+                    FROM chat_history
+                    GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+                ) latest_ids ON latest_ids.max_id = ch.id
+            ) latest ON latest.session_id = counts.session_id;
+        ''')
+
 def init_db():
     Path(DB_PATH).expanduser().parent.mkdir(parents=True, exist_ok=True)
     db = get_db_connection()
@@ -692,6 +799,8 @@ def init_db():
         db.execute("CREATE INDEX IF NOT EXISTS idx_session_timestamp ON chat_history(session_id, timestamp);")
         db.execute("CREATE INDEX IF NOT EXISTS idx_user_timestamp ON chat_history(user_id, timestamp);")
         db.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_history(timestamp);")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_session_id_desc ON chat_history(session_id, id DESC);")
+        ensure_session_stats(db)
         db.commit()
     finally:
         db.close()

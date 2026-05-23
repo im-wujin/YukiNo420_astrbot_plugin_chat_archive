@@ -464,6 +464,8 @@ body {
 
 .message-group,
 .skeleton-group {
+    content-visibility: auto;
+    contain-intrinsic-size: 96px;
     display: flex;
     gap: 0.85rem;
     max-width: 80%;
@@ -832,6 +834,8 @@ body {
 
 /* System Messages Centered */
 .msg-system-center {
+    content-visibility: auto;
+    contain-intrinsic-size: 48px;
     display: flex;
     justify-content: center;
     align-items: center;
