@@ -10,6 +10,7 @@ import hashlib
 import ipaddress
 import socket
 import os
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlparse
 import httpx
@@ -369,7 +370,7 @@ class ArchiveGetContextMessagesTool(FunctionTool[AstrAgentContext]):
         )
 
 
-@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天消息存档插件", "v1.2.2")
+@register("astrbot_plugin_chat_archive", "yukino42", "高性能聊天消息存档插件", "v1.3.0")
 class ChatArchivePlugin(Star):
     # Batch writer configuration
     _BATCH_SIZE = 50
@@ -524,7 +525,8 @@ class ChatArchivePlugin(Star):
         return str(getattr(event, "sender_id", "") or "")
 
     @staticmethod
-    def _load_admin_ids() -> set[str]:
+    @lru_cache(maxsize=1)
+    def _load_admin_ids() -> frozenset[str]:
         admin_ids = set()
         try:
             config_dir = DATA_DIR.parent.parent / "config"
@@ -543,7 +545,7 @@ class ChatArchivePlugin(Star):
                             admin_ids.add(admin_str.replace("UID: ", "").strip())
         except Exception as e:
             logger.debug(f"Chat Archive: 加载管理员 ID 失败: {e}")
-        return admin_ids
+        return frozenset(admin_ids)
 
     def _is_admin_tool_context(self, context) -> bool:
         event = self._extract_tool_event(context)

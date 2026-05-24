@@ -5,9 +5,11 @@ import datetime
 import json
 import secrets
 import os
+import time
 import threading
 import ipaddress
 import socket
+from contextlib import suppress
 from functools import lru_cache
 from urllib.parse import urlparse
 from pathlib import Path
@@ -19,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from starlette.background import BackgroundTask
 
 try:
     from ..db_config import get_db_connection, init_db
@@ -79,7 +82,7 @@ def _load_api_key() -> str:
                     return key
         except Exception as e:
             logger.error(f"从配置文件加载 API Key 失败: {e}")
-            
+
     return ""
 
 API_KEY = _load_api_key()
@@ -189,7 +192,7 @@ ALLOWED_MEDIA_DOMAINS = _load_allowed_media_domains()
 @lru_cache(maxsize=1)
 def load_right_align_ids():
     """加载管理员 ID 列表用于 WebUI 中的消息右对齐显示。
-    
+
     注意: 使用 @lru_cache 缓存，管理员列表变更后需要重启服务才能生效。
     """
     right_align_ids = {"astrbot", "bot", "99999"}
@@ -257,7 +260,7 @@ async def auth_middleware(request: Request, call_next):
 
     # Support API Key via header or HttpOnly cookie. Never accept API keys in URLs.
     req_key = request.headers.get("X-API-Key", "") or request.cookies.get("archive_auth", "")
-    
+
     if not req_key or not secrets.compare_digest(req_key, API_KEY):
         return JSONResponse(
             status_code=401,
@@ -269,6 +272,386 @@ async def auth_middleware(request: Request, call_next):
 app.mount("/static/cache", StaticFiles(directory=str(cache_static_dir), check_dir=False), name="cache")
 app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 templates = Jinja2Templates(directory=str(templates_dir))
+
+_DASHBOARD_CACHE: dict[str, tuple[float, dict]] = {}
+_DASHBOARD_CACHE_LOCK = threading.Lock()
+_STATS_CACHE: dict[str, tuple[float, dict]] = {}
+_STATS_CACHE_LOCK = threading.Lock()
+
+
+def _load_dashboard_cache_ttl() -> int:
+    try:
+        ttl = int(os.environ.get("ARCHIVE_DASHBOARD_CACHE_TTL", "30") or "30")
+    except (TypeError, ValueError):
+        ttl = 30
+    return max(5, min(ttl, 300))
+
+
+_DASHBOARD_CACHE_TTL = _load_dashboard_cache_ttl()
+
+
+def _load_stats_cache_ttl() -> int:
+    try:
+        ttl = int(os.environ.get("ARCHIVE_STATS_CACHE_TTL", "15") or "15")
+    except (TypeError, ValueError):
+        ttl = 15
+    return max(0, min(ttl, 300))
+
+
+def _load_history_message_max_chars() -> int:
+    try:
+        value = int(os.environ.get("ARCHIVE_HISTORY_MESSAGE_MAX_CHARS", "12000") or "12000")
+    except (TypeError, ValueError):
+        value = 12000
+    return max(512, min(value, 200000))
+
+
+_STATS_CACHE_TTL = _load_stats_cache_ttl()
+_HISTORY_MESSAGE_MAX_CHARS = _load_history_message_max_chars()
+
+
+def _table_has_columns(db, table: str, columns: tuple[str, ...]) -> bool:
+    try:
+        rows = db.execute(f"PRAGMA table_info({table});").fetchall()
+        existing = {row["name"] for row in rows}
+        return all(col in existing for col in columns)
+    except Exception:
+        return False
+
+
+def _where_clause(conditions: list[str]) -> str:
+    return " WHERE " + " AND ".join(conditions)
+
+
+def _fetch_latest_sender_names(
+    db,
+    user_ids: list[str],
+    conditions: list[str],
+    params: list,
+) -> dict[str, str]:
+    if not user_ids:
+        return {}
+    placeholders = ",".join("?" for _ in user_ids)
+    name_conditions = [
+        *conditions,
+        f"user_id IN ({placeholders})",
+        "sender_name IS NOT NULL",
+        "sender_name != ''",
+    ]
+    name_sql = f"""
+        SELECT user_id, sender_name
+        FROM (
+            SELECT user_id,
+                   sender_name,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY user_id
+                       ORDER BY timestamp DESC, id DESC
+                   ) as rn
+            FROM chat_history {_where_clause(name_conditions)}
+        ) ranked
+        WHERE rn = 1
+    """
+    rows = db.execute(name_sql, [*params, *user_ids]).fetchall()
+    return {str(row["user_id"]): str(row["sender_name"]) for row in rows}
+
+
+def _fetch_user_counts(
+    db,
+    conditions: list[str],
+    params: list,
+    limit: int,
+    offset: int = 0,
+) -> list[dict]:
+    rows = db.execute(
+        f"""
+            SELECT user_id, COUNT(*) as cnt
+            FROM chat_history {_where_clause(conditions)}
+            GROUP BY user_id
+            ORDER BY cnt DESC, user_id ASC
+            LIMIT ? OFFSET ?
+        """,
+        [*params, limit, offset],
+    ).fetchall()
+    if not rows:
+        return []
+
+    user_ids = [str(row["user_id"]) for row in rows]
+    latest_names = _fetch_latest_sender_names(db, user_ids, conditions, params)
+    return [
+        {
+            "user_id": str(row["user_id"]),
+            "sender_name": latest_names.get(str(row["user_id"])) or str(row["user_id"]),
+            "cnt": int(row["cnt"] or 0),
+        }
+        for row in rows
+    ]
+
+
+async def _close_media_upstream(response: httpx.Response | None, client: httpx.AsyncClient | None):
+    if response is not None:
+        with suppress(Exception):
+            await response.aclose()
+    if client is not None:
+        with suppress(Exception):
+            await client.aclose()
+
+
+def _session_display_name(session_id: str, message_type: str, session_name: str = "", sender_name: str = "") -> str:
+    session_id = str(session_id or "legacy:archive")
+    message_type = str(message_type or "legacy")
+    if session_id == "legacy:archive":
+        return "📦 历史记录 (未分类)"
+    if session_name and str(session_name).strip():
+        return str(session_name).strip()
+    short_id = session_id.split(":")[-1] if ":" in session_id else session_id
+    mt = message_type.lower()
+    if "group" in mt:
+        return f"群聊: {short_id}"
+    if "friend" in mt:
+        return f"👤 私聊: {sender_name or short_id}"
+    return session_id
+
+
+def _message_preview(message: str, max_len: int = 120) -> str:
+    text = str(message or "")
+    for marker, label in (
+        ("[CQ:image", "[图片"),
+        ("[CQ:video", "[视频"),
+        ("[CQ:record", "[语音"),
+        ("[CQ:file", "[文件"),
+    ):
+        text = text.replace(marker, label)
+    text = " ".join(text.split())
+    return text[: max_len - 1] + "…" if len(text) > max_len else text
+
+
+def _dashboard_range_days(range_key: str) -> tuple[str, int]:
+    normalized = str(range_key or "30d").lower().strip()
+    mapping = {"1d": 1, "7d": 7, "30d": 30}
+    if normalized not in mapping:
+        normalized = "30d"
+    return normalized, mapping[normalized]
+
+
+def _compute_dashboard(range_key: str, recent_limit: int) -> dict:
+    db = None
+    try:
+        db = get_db_connection()
+        has_media_columns = _table_has_columns(db, "chat_history", ("has_image", "has_video", "msg_kind"))
+        if not has_media_columns:
+            logger.warning("Dashboard media columns are missing; attempting one schema refresh before serving aggregates.")
+            try:
+                db.close()
+                db = None
+                init_db()
+            except Exception as e:
+                logger.warning(f"Dashboard schema refresh failed; media aggregates will be omitted: {e}")
+            finally:
+                if db is None:
+                    db = get_db_connection()
+            has_media_columns = _table_has_columns(db, "chat_history", ("has_image", "has_video", "msg_kind"))
+
+        local_now = datetime.datetime.now().astimezone()
+        local_today_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        today_start = int(local_today_midnight.timestamp())
+        local_offset = int(local_now.utcoffset().total_seconds()) if local_now.utcoffset() else 0
+        range_key, trend_days = _dashboard_range_days(range_key)
+        trend_start_dt = local_today_midnight - datetime.timedelta(days=trend_days - 1)
+        trend_start = int(trend_start_dt.timestamp())
+
+        # Measure Summary Time
+        t_summary_start = time.perf_counter()
+        try:
+            row = db.execute("SELECT COALESCE(SUM(message_count), 0) as c, COUNT(*) as sessions FROM session_stats").fetchone()
+            total_messages = int(row["c"] or 0) if row else 0
+            total_sessions = int(row["sessions"] or 0) if row else 0
+        except Exception:
+            total_messages = int(db.execute("SELECT COUNT(*) as c FROM chat_history").fetchone()["c"] or 0)
+            total_sessions = int(db.execute("""
+                SELECT COUNT(*) as c FROM (
+                    SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+                    FROM chat_history
+                    GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+                )
+            """).fetchone()["c"] or 0)
+
+        today_messages = int(db.execute(
+            "SELECT COUNT(*) as c FROM chat_history WHERE timestamp >= ?",
+            [today_start],
+        ).fetchone()["c"] or 0)
+
+        if has_media_columns:
+            total_images = int(db.execute("SELECT COUNT(*) as c FROM chat_history WHERE has_image = 1").fetchone()["c"] or 0)
+            total_videos = int(db.execute("SELECT COUNT(*) as c FROM chat_history WHERE has_video = 1").fetchone()["c"] or 0)
+            type_rows = db.execute("""
+                SELECT COALESCE(NULLIF(msg_kind, ''), 'text') as kind, COUNT(*) as cnt
+                FROM chat_history
+                GROUP BY msg_kind
+            """).fetchall()
+        else:
+            logger.warning("Dashboard media columns unavailable; skipping expensive LIKE fallback scan.")
+            total_images = 0
+            total_videos = 0
+            type_rows = [
+                {"kind": "text", "cnt": total_messages},
+            ]
+        time_summary_ms = round((time.perf_counter() - t_summary_start) * 1000, 2)
+
+        # Measure Type Distribution Time
+        t_type_start = time.perf_counter()
+        text_count = 0
+        image_count = 0
+        other_count = 0
+        for r_row in type_rows:
+            kind = str(r_row.get("kind", "text") if isinstance(r_row, dict) else r_row["kind"] or "text")
+            count = int(r_row.get("cnt", 0) if isinstance(r_row, dict) else r_row["cnt"] or 0)
+            if kind == "text":
+                text_count += count
+            elif kind == "image":
+                image_count += count
+            else:
+                other_count += count
+
+        message_type_distribution = []
+        if text_count > 0:
+            message_type_distribution.append({"type": "text", "name": "文本", "count": text_count})
+        if image_count > 0:
+            message_type_distribution.append({"type": "image", "name": "图片", "count": image_count})
+        if other_count > 0:
+            message_type_distribution.append({"type": "other", "name": "其他", "count": other_count})
+        message_type_distribution.sort(key=lambda item: item["count"], reverse=True)
+        time_type_ms = round((time.perf_counter() - t_type_start) * 1000, 2)
+
+        # Measure Trend Time
+        t_trend_start = time.perf_counter()
+        if range_key == "1d":
+            trend_start_dt = local_now - datetime.timedelta(hours=23)
+            trend_start_dt = trend_start_dt.replace(minute=0, second=0, microsecond=0)
+            trend_start = int(trend_start_dt.timestamp())
+
+            trend_rows = db.execute(f"""
+                SELECT CAST((timestamp + {local_offset}) / 3600 AS INTEGER) as hour_bucket, COUNT(*) as cnt
+                FROM chat_history
+                WHERE timestamp >= ?
+                GROUP BY hour_bucket
+                ORDER BY hour_bucket
+            """, [trend_start]).fetchall()
+            trend_map = {int(row["hour_bucket"]): int(row["cnt"] or 0) for row in trend_rows}
+            activity_trend = []
+            for idx in range(24):
+                hour_dt = trend_start_dt + datetime.timedelta(hours=idx)
+                bucket = int((int(hour_dt.timestamp()) + local_offset) / 3600)
+                activity_trend.append({
+                    "date": hour_dt.strftime("%m-%d %H:00"),
+                    "count": trend_map.get(bucket, 0)
+                })
+        else:
+            trend_rows = db.execute(f"""
+                SELECT CAST((timestamp + {local_offset}) / 86400 AS INTEGER) as day_bucket, COUNT(*) as cnt
+                FROM chat_history
+                WHERE timestamp >= ?
+                GROUP BY day_bucket
+                ORDER BY day_bucket
+            """, [trend_start]).fetchall()
+            trend_map = {int(row["day_bucket"]): int(row["cnt"] or 0) for row in trend_rows}
+            activity_trend = []
+            for idx in range(trend_days):
+                day_dt = trend_start_dt + datetime.timedelta(days=idx)
+                bucket = int((int(day_dt.timestamp()) + local_offset) / 86400)
+                activity_trend.append({"date": day_dt.strftime("%Y-%m-%d"), "count": trend_map.get(bucket, 0)})
+        time_trend_ms = round((time.perf_counter() - t_trend_start) * 1000, 2)
+
+        # Measure Top Groups Time
+        t_groups_start = time.perf_counter()
+        try:
+            group_rows = db.execute("""
+                SELECT session_id, session_name, message_type, message_count, last_time, last_msg, sender_name
+                FROM session_stats
+                WHERE message_type IN ('group', 'GroupMessage') OR LOWER(COALESCE(message_type, '')) LIKE '%group%'
+                ORDER BY message_count DESC, last_time DESC
+                LIMIT 10
+            """).fetchall()
+        except Exception:
+            group_rows = db.execute("""
+                SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive') as session_id,
+                       session_name,
+                       COALESCE(message_type, 'legacy') as message_type,
+                       COUNT(*) as message_count,
+                       MAX(timestamp) as last_time,
+                       '' as last_msg,
+                       '' as sender_name
+                FROM chat_history
+                WHERE message_type IN ('group', 'GroupMessage') OR LOWER(COALESCE(message_type, '')) LIKE '%group%'
+                GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+                ORDER BY message_count DESC, last_time DESC
+                LIMIT 10
+            """).fetchall()
+        top_groups = []
+        for row in group_rows:
+            sid = str(row["session_id"] or "legacy:archive")
+            mt = str(row["message_type"] or "legacy")
+            top_groups.append({
+                "session_id": sid,
+                "session_name": row["session_name"] or "",
+                "name": _session_display_name(sid, mt, row["session_name"] or "", row["sender_name"] or ""),
+                "message_type": mt,
+                "message_count": int(row["message_count"] or 0),
+                "last_time": int(row["last_time"] or 0),
+                "last_msg": _message_preview(row["last_msg"] or "", 100),
+            })
+        time_groups_ms = round((time.perf_counter() - t_groups_start) * 1000, 2)
+
+        # Measure Database Size
+        try:
+            page_count_row = db.execute("PRAGMA page_count;").fetchone()
+            page_size_row = db.execute("PRAGMA page_size;").fetchone()
+
+            if isinstance(page_count_row, dict):
+                page_count = list(page_count_row.values())[0]
+            else:
+                page_count = page_count_row[0]
+
+            if isinstance(page_size_row, dict):
+                page_size = list(page_size_row.values())[0]
+            else:
+                page_size = page_size_row[0]
+
+            db_size_bytes = int(page_count or 0) * int(page_size or 0)
+            db_size_mb = round(db_size_bytes / (1024 * 1024), 2)
+        except Exception as e:
+            logger.error(f"Failed to measure database size: {e}")
+            db_size_mb = 0.0
+
+        performance = {
+            "db_size_mb": db_size_mb,
+            "time_summary_ms": time_summary_ms,
+            "time_type_ms": time_type_ms,
+            "time_trend_ms": time_trend_ms,
+            "time_groups_ms": time_groups_ms,
+            "total_db_time_ms": round(time_summary_ms + time_type_ms + time_trend_ms + time_groups_ms, 2),
+            "cache_hit": False
+        }
+
+        return {
+            "summary": {
+                "total_messages": total_messages,
+                "today_messages": today_messages,
+                "total_sessions": total_sessions,
+                "total_images": total_images,
+                "total_videos": total_videos,
+            },
+            "activity_trend": activity_trend,
+            "top_groups": top_groups,
+            "message_type_distribution": message_type_distribution,
+            "range": range_key,
+            "performance": performance,
+            "generated_at": int(time.time()),
+            "cache_ttl": _DASHBOARD_CACHE_TTL,
+        }
+    finally:
+        if db:
+            db.close()
+
 
 @app.get("/", response_class=HTMLResponse)
 async def index(request: Request):
@@ -326,11 +709,12 @@ def get_history(
     limit: int = Query(50, ge=1, le=200),
     cursor: int = Query(0, ge=0),
     include_total: bool = Query(False),
+    full_message: bool = Query(False),
 ):
     db = None
     try:
         db = get_db_connection()
-        
+
         conditions = ["1=1"]
         params = []
 
@@ -360,6 +744,26 @@ def get_history(
             params.append(time_end)
 
         where_cl = " WHERE " + " AND ".join(conditions)
+        if full_message:
+            select_columns = """
+                id, user_id, sender_name, message,
+                COALESCE(LENGTH(message), 0) as message_length,
+                0 as message_truncated,
+                timestamp, session_id, message_type, session_name, msg_id, is_recalled
+            """
+            select_params = []
+        else:
+            select_columns = """
+                id, user_id, sender_name,
+                CASE
+                    WHEN COALESCE(LENGTH(message), 0) > ? THEN SUBSTR(message, 1, ?)
+                    ELSE message
+                END as message,
+                COALESCE(LENGTH(message), 0) as message_length,
+                CASE WHEN COALESCE(LENGTH(message), 0) > ? THEN 1 ELSE 0 END as message_truncated,
+                timestamp, session_id, message_type, session_name, msg_id, is_recalled
+            """
+            select_params = [_HISTORY_MESSAGE_MAX_CHARS, _HISTORY_MESSAGE_MAX_CHARS, _HISTORY_MESSAGE_MAX_CHARS]
 
         query_conditions = list(conditions)
         query_params = list(params)
@@ -368,15 +772,15 @@ def get_history(
             query_conditions.append("id < ?")
             query_params.append(cursor)
             where_cl_cursor = " WHERE " + " AND ".join(query_conditions)
-            query = f"SELECT * FROM chat_history {where_cl_cursor} ORDER BY id DESC LIMIT ?"
+            query = f"SELECT {select_columns} FROM chat_history {where_cl_cursor} ORDER BY id DESC LIMIT ?"
             query_params.append(limit)
         else:
             # Subquery pagination optimization to avoid performance degradation on deep offsets
-            query = f"SELECT * FROM chat_history WHERE id IN (SELECT id FROM chat_history {where_cl} ORDER BY id DESC LIMIT ? OFFSET ?) ORDER BY id DESC"
+            query = f"SELECT {select_columns} FROM chat_history WHERE id IN (SELECT id FROM chat_history {where_cl} ORDER BY id DESC LIMIT ? OFFSET ?) ORDER BY id DESC"
             offset = (page - 1) * limit
             query_params.extend([limit, offset])
 
-        records = db.execute(query, query_params).fetchall()
+        records = db.execute(query, [*select_params, *query_params]).fetchall()
 
         if records:
             next_cursor = records[-1]["id"]
@@ -415,16 +819,16 @@ def get_history(
             uid = str(item.get("user_id", "")).strip()
             sname = str(item.get("sender_name", "")).strip()
             msg_type = str(item.get("message_type", "")).strip().lower()
-            
+
             is_right = False
             is_bot = sname.lower() == "bot" or "bot" in uid.lower() or uid == "99999"
             is_admin = uid in right_ids
-            
+
             if is_bot:
                 is_right = True
             elif is_admin and "group" in msg_type:
                 is_right = True
-                
+
             item["is_right"] = is_right
             processed_records.append(item)
 
@@ -482,19 +886,17 @@ async def proxy_image(url: str = Query(..., max_length=4096)):
         request = client.build_request("GET", url, headers=headers)
         response = await client.send(request, stream=True)
     except Exception as e:
-        await client.aclose()
+        await _close_media_upstream(None, client)
         logger.error(f"Media proxy open stream error for {url}: {e}")
         raise HTTPException(status_code=502, detail="Media upstream unavailable")
 
     if response.status_code != 200:
-        await response.aclose()
-        await client.aclose()
+        await _close_media_upstream(response, client)
         raise HTTPException(status_code=response.status_code, detail="Media upstream failed")
 
     content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     if not (content_type.startswith("image/") or content_type.startswith("video/")):
-        await response.aclose()
-        await client.aclose()
+        await _close_media_upstream(response, client)
         logger.warning(f"Media proxy rejected non-image/video response: {url}, content-type={content_type or 'unknown'}")
         raise HTTPException(status_code=415, detail="Unsupported media type")
 
@@ -502,8 +904,7 @@ async def proxy_image(url: str = Query(..., max_length=4096)):
     if content_length:
         try:
             if int(content_length) > MEDIA_MAX_BYTES:
-                await response.aclose()
-                await client.aclose()
+                await _close_media_upstream(response, client)
                 logger.warning(f"Media proxy rejected oversized response by content-length: {url}, size={content_length}")
                 raise HTTPException(status_code=413, detail="Media too large")
         except ValueError:
@@ -521,10 +922,13 @@ async def proxy_image(url: str = Query(..., max_length=4096)):
         except Exception as e:
             logger.error(f"Media proxy error for {url}: {e}")
         finally:
-            await response.aclose()
-            await client.aclose()
+            await _close_media_upstream(response, client)
 
-    return StreamingResponse(stream_media(), media_type=content_type)
+    return StreamingResponse(
+        stream_media(),
+        media_type=content_type,
+        background=BackgroundTask(_close_media_upstream, response, client),
+    )
 
 
 @app.get("/api/sessions")
@@ -577,7 +981,7 @@ def get_sessions():
             if s["message_type"] in ["group", "GroupMessage"]:
                 group_id = s_id.split(":")[-1] if ":" in s_id else s_id
                 avatar = f"https://p.qlogo.cn/gh/{group_id}/{group_id}/100/"
-                
+
                 db_name = s.get("session_name")
                 if db_name and db_name.strip():
                     name = db_name.strip()
@@ -603,6 +1007,36 @@ def get_sessions():
         if db:
             db.close()
 
+@app.get("/api/dashboard")
+def get_dashboard(
+    range: str = Query("30d", max_length=8),
+    recent_limit: int = Query(12, ge=1, le=50),
+    refresh: bool = Query(False),
+):
+    range_key, _ = _dashboard_range_days(range)
+    cache_key = f"{range_key}:{recent_limit}"
+    now = time.time()
+    if not refresh:
+        with _DASHBOARD_CACHE_LOCK:
+            cached = _DASHBOARD_CACHE.get(cache_key)
+            if cached and cached[0] > now:
+                payload = dict(cached[1])
+                payload["cached"] = True
+                if "performance" in payload:
+                    payload["performance"] = dict(payload["performance"])
+                    payload["performance"]["cache_hit"] = True
+                return JSONResponse(content={"success": True, "data": payload})
+
+    try:
+        data = _compute_dashboard(range_key, recent_limit)
+        data["cached"] = False
+        with _DASHBOARD_CACHE_LOCK:
+            _DASHBOARD_CACHE[cache_key] = (now + _DASHBOARD_CACHE_TTL, data)
+        return JSONResponse(content={"success": True, "data": data})
+    except Exception as e:
+        logger.error(f"WebUI get_dashboard error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/stats")
 def get_stats(
     session_id: str = Query("", max_length=256),
@@ -613,8 +1047,20 @@ def get_stats(
 ):
     db = None
     try:
+        cache_key = json.dumps(
+            [session_id, user_id, int(time_start or 0), int(time_end or 0), int(is_private or 0)],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        now = time.time()
+        if _STATS_CACHE_TTL > 0:
+            with _STATS_CACHE_LOCK:
+                cached = _STATS_CACHE.get(cache_key)
+                if cached and cached[0] > now:
+                    return JSONResponse(content={"success": True, "data": cached[1]})
+
         db = get_db_connection()
-        
+
         conditions = ["1=1"]
         params = []
         if session_id == "legacy:archive":
@@ -635,60 +1081,41 @@ def get_stats(
             params.append(time_end)
 
         where_cl = " WHERE " + " AND ".join(conditions)
+        has_media_columns = _table_has_columns(db, "chat_history", ("has_image", "has_video", "msg_kind"))
 
-        # Total count
-        total = db.execute(f"SELECT COUNT(*) as c FROM chat_history {where_cl}", params).fetchone()["c"]
-
-        # Today count (using local timezone dynamically, starting from today's midnight)
         local_now = datetime.datetime.now().astimezone()
         local_today_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
         today_start = int(local_today_midnight.timestamp())
-        today_total = db.execute(f"SELECT COUNT(*) as c FROM chat_history {where_cl} AND timestamp >= ?", [*params, today_start]).fetchone()["c"]
-
-        # Time distribution (24h divided into 12 slots of 2h)
-        # Determine the host system's timezone offset in seconds dynamically
         local_offset = int(local_now.utcoffset().total_seconds())
-        dist_sql = f"""
-            SELECT CAST(((timestamp + {local_offset}) / 7200) % 12 AS INTEGER) as slot, COUNT(*) as cnt
-            FROM chat_history {where_cl}
-            GROUP BY slot ORDER BY slot
-        """
-        dist_rows = db.execute(dist_sql, params).fetchall()
-        distribution = [0] * 12
-        for r in dist_rows:
-            distribution[r["slot"]] = r["cnt"]
 
-        # Top users
-        top_sql = f"""
-            WITH filtered AS (
-                SELECT id, user_id, sender_name, timestamp
+        slot_columns = ",\n".join(
+            f"SUM(CASE WHEN CAST(((timestamp + {local_offset}) / 7200) % 12 AS INTEGER) = {slot} THEN 1 ELSE 0 END) as slot_{slot}"
+            for slot in range(12)
+        )
+        summary_row = db.execute(
+            f"""
+                SELECT COUNT(*) as total,
+                       SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) as today_total,
+                       {slot_columns}
                 FROM chat_history {where_cl}
-                AND user_id IS NOT NULL AND user_id != '' AND user_id != '0'
-                AND (is_recalled IS NULL OR is_recalled = 0)
-            )
-            SELECT grouped.user_id,
-                   COALESCE(
-                       (
-                           SELECT f.sender_name
-                           FROM filtered f
-                           WHERE f.user_id = grouped.user_id
-                           AND f.sender_name IS NOT NULL
-                           AND f.sender_name != ''
-                           ORDER BY f.timestamp DESC, f.id DESC
-                           LIMIT 1
-                       ),
-                       grouped.user_id
-                   ) as sender_name,
-                   grouped.cnt
-            FROM (
-                SELECT user_id, COUNT(*) as cnt
-                FROM filtered
-                GROUP BY user_id
-            ) grouped
-            ORDER BY grouped.cnt DESC, grouped.user_id ASC
-            LIMIT 30
-        """
-        top_rows = db.execute(top_sql, params).fetchall()
+            """,
+            [today_start, *params],
+        ).fetchone()
+        total = int(summary_row["total"] or 0) if summary_row else 0
+        today_total = int(summary_row["today_total"] or 0) if summary_row else 0
+        distribution = [
+            int(summary_row[f"slot_{slot}"] or 0) if summary_row else 0
+            for slot in range(12)
+        ]
+
+        top_conditions = [
+            *conditions,
+            "user_id IS NOT NULL",
+            "user_id != ''",
+            "user_id != '0'",
+            "(is_recalled IS NULL OR is_recalled = 0)",
+        ]
+        top_rows = _fetch_user_counts(db, top_conditions, params, 30)
         top_users = []
         for r in top_rows:
             top_users.append({
@@ -702,41 +1129,46 @@ def get_stats(
         avg_text_len = 0
         message_types = []
         if user_id:
-            days_sql = f"""
-                SELECT COUNT(DISTINCT CAST(timestamp / 86400 AS INTEGER)) as days
-                FROM chat_history {where_cl}
-            """
-            active_days = db.execute(days_sql, params).fetchone()["days"]
+            image_expr = (
+                "SUM(CASE WHEN has_image = 1 THEN 1 ELSE 0 END)"
+                if has_media_columns
+                else "SUM(CASE WHEN message LIKE '%[CQ:image%' THEN 1 ELSE 0 END)"
+            )
+            detail_row = db.execute(
+                f"""
+                    SELECT COUNT(DISTINCT CAST(timestamp / 86400 AS INTEGER)) as days,
+                           AVG(CASE
+                               WHEN message NOT LIKE '[CQ:%' AND message NOT LIKE '<Event%' THEN LENGTH(message)
+                               ELSE NULL
+                           END) as avg_len,
+                           {image_expr} as image_count
+                    FROM chat_history {where_cl}
+                """,
+                params,
+            ).fetchone()
+            active_days = int(detail_row["days"] or 0) if detail_row else 0
+            avg_text_len = round(detail_row["avg_len"]) if detail_row and detail_row["avg_len"] else 0
 
-            len_sql = f"""
-                SELECT AVG(LENGTH(message)) as avg_len
-                FROM chat_history {where_cl}
-                AND message NOT LIKE '[CQ:%' AND message NOT LIKE '<Event%'
-            """
-            avg_len_row = db.execute(len_sql, params).fetchone()
-            avg_text_len = round(avg_len_row["avg_len"]) if avg_len_row["avg_len"] else 0
-
-            image_count = db.execute(f"SELECT COUNT(*) as c FROM chat_history {where_cl} AND message LIKE '%[CQ:image%'", params).fetchone()["c"]
-            text_count = total - image_count
+            image_count = int(detail_row["image_count"] or 0) if detail_row else 0
+            text_count = max(total - image_count, 0)
             message_types = [
                 {"name": "文本消息", "value": text_count},
                 {"name": "图片消息", "value": image_count},
             ]
 
-        return JSONResponse(
-            content={
-                "success": True,
-                "data": {
-                    "total_messages": total,
-                    "today_messages": today_total,
-                    "active_days": active_days,
-                    "avg_text_length": avg_text_len,
-                    "time_distribution": distribution,
-                    "top_users": top_users,
-                    "message_types": message_types if message_types else None,
-                }
-            }
-        )
+        payload = {
+            "total_messages": total,
+            "today_messages": today_total,
+            "active_days": active_days,
+            "avg_text_length": avg_text_len,
+            "time_distribution": distribution,
+            "top_users": top_users,
+            "message_types": message_types if message_types else None,
+        }
+        if _STATS_CACHE_TTL > 0:
+            with _STATS_CACHE_LOCK:
+                _STATS_CACHE[cache_key] = (now + _STATS_CACHE_TTL, payload)
+        return JSONResponse(content={"success": True, "data": payload})
     except Exception as e:
         logger.error(f"WebUI get_stats error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -795,34 +1227,7 @@ def get_members(
         """
         total = db.execute(count_sql, params).fetchone()["total"]
 
-        members_sql = f"""
-            WITH filtered AS (
-                SELECT id, user_id, sender_name, timestamp
-                FROM chat_history {where_cl}
-            )
-            SELECT grouped.user_id,
-                   COALESCE(
-                       (
-                           SELECT f.sender_name
-                           FROM filtered f
-                           WHERE f.user_id = grouped.user_id
-                           AND f.sender_name IS NOT NULL
-                           AND f.sender_name != ''
-                           ORDER BY f.timestamp DESC, f.id DESC
-                           LIMIT 1
-                       ),
-                       grouped.user_id
-                   ) as sender_name,
-                   grouped.cnt
-            FROM (
-                SELECT user_id, COUNT(*) as cnt
-                FROM filtered
-                GROUP BY user_id
-            ) grouped
-            ORDER BY grouped.cnt DESC, grouped.user_id ASC
-            LIMIT ? OFFSET ?
-        """
-        rows = db.execute(members_sql, [*params, limit, offset]).fetchall()
+        rows = _fetch_user_counts(db, conditions, params, limit, offset)
         members = [
             {"user_id": r["user_id"], "sender_name": r["sender_name"], "count": r["cnt"]}
             for r in rows
@@ -855,7 +1260,7 @@ def _load_custom_apis():
         ext_dir = data_dir.parent.parent / "chat_archive_ext"
         if not ext_dir.exists():
             ext_dir = Path(__file__).resolve().parent.parent.parent.parent / "chat_archive_ext"
-        
+
         if ext_dir.exists():
             # Security check: directory must not be world-writable
             try:
@@ -908,10 +1313,10 @@ class AdminServer:
             self.port = int(os.environ.get("ARCHIVE_PORT", "").strip() or port)
         except (TypeError, ValueError):
             self.port = 8090
-        
+
         global API_KEY
         API_KEY = os.environ.get("ARCHIVE_API_KEY", "").strip() or api_key or API_KEY
-            
+
         self.config = uvicorn.Config(app, host=self.host, port=self.port, log_level="warning")
         self.server = uvicorn.Server(self.config)
         self.thread = None
@@ -920,19 +1325,19 @@ class AdminServer:
         """在守护线程中启动 Uvicorn，避免阻塞 AstrBot 主进程事件循环"""
         if self.thread and self.thread.is_alive():
             return
-            
+
         def _run():
             asyncio.run(self.server.serve())
 
         self.thread = threading.Thread(target=_run, daemon=True)
         self.thread.start()
-        
+
         # Load custom extension APIs after server starts, when API_KEY is set
         global _custom_apis_loaded
         if not _custom_apis_loaded:
             _load_custom_apis()
             _custom_apis_loaded = True
-        
+
         logger.info(f"Chat Archive WebUI started on http://{self.host}:{self.port}")
 
     async def stop(self):

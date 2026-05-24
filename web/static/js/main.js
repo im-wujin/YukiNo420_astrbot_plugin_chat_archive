@@ -44,6 +44,7 @@ let memberAutoFillCount = 0;
 let filterStart = 0;
 let filterEnd = 0;
 let activeMsgType = '';
+const sessionsById = new Map();
 
 function isFriendSessionType(type = activeMsgType) {
     return safeText(type).toLowerCase().includes('friend');
@@ -230,6 +231,402 @@ function formatSessionPreview(text) {
         .replace(/\[CQ:reply,[^\]]*\]/g, '[回复]')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+function getDesiredSessionId() {
+    return new URLSearchParams(window.location.search).get('session_id') || '';
+}
+
+function updateSessionUrl(sessionId, replace = false) {
+    if (!sessionId) return;
+    const url = new URL(window.location.href);
+    url.searchParams.set('session_id', sessionId);
+    const state = { session_id: sessionId };
+    if (replace) window.history.replaceState(state, '', url);
+    else window.history.pushState(state, '', url);
+}
+
+function updateDashboardUrl(replace = false) {
+    const url = new URL(window.location.href);
+    url.searchParams.delete('session_id');
+    const state = { view: 'dashboard' };
+    if (replace) window.history.replaceState(state, '', url);
+    else window.history.pushState(state, '', url);
+}
+
+function formatCompactNumber(value) {
+    const n = safeCount(value);
+    if (n >= 100000000) return `${(n / 100000000).toFixed(1)}亿`;
+    if (n >= 10000) return `${(n / 10000).toFixed(1)}万`;
+    return n.toLocaleString();
+}
+
+function renderDashboardTrendSvg(points = []) {
+    const values = points.map(p => safeCount(p.count));
+    const maxValue = Math.max(...values, 1);
+    const width = 640;
+    const height = 180;
+    const padX = 28;
+    const padY = 24;
+    const usableW = width - padX * 2;
+    const usableH = height - padY * 2;
+    const coords = values.map((value, idx) => {
+        const x = padX + (points.length <= 1 ? 0 : (idx / (points.length - 1)) * usableW);
+        const y = padY + usableH - (value / maxValue) * usableH;
+        return { x, y, value, date: points[idx]?.date || '' };
+    });
+    const polyline = coords.map(p => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ');
+    const ticks = [0, 0.5, 1].map(t => {
+        const y = padY + usableH - usableH * t;
+        return `<g><line x1="${padX}" y1="${y}" x2="${width - padX}" y2="${y}" class="dashboard-grid"/><text x="${padX}" y="${y - 4}" class="dashboard-axis">${Math.round(maxValue * t).toLocaleString()}</text></g>`;
+    }).join('');
+    const circles = coords.map(p => `<circle class="dashboard-dot" cx="${p.x.toFixed(1)}" cy="${p.y.toFixed(1)}" r="4.5" data-date="${escapeAttr(p.date)}" data-value="${p.value}" style="cursor: pointer; transition: r 0.15s ease, fill 0.15s ease;"><title>${escapeAttr(p.date)}：${p.value.toLocaleString()} 条</title></circle>`).join('');
+    const labels = coords.filter((_p, idx) => idx === 0 || idx === coords.length - 1 || idx % Math.ceil(Math.max(coords.length, 1) / 4) === 0)
+        .map(p => `<text x="${p.x.toFixed(1)}" y="${height - 4}" text-anchor="middle" class="dashboard-axis">${escapeAttr(p.date.slice(5))}</text>`).join('');
+    return `<svg class="dashboard-trend-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="消息活跃趋势">
+        ${ticks}
+        ${polyline ? `<polyline points="${polyline}" class="dashboard-line"></polyline>` : ''}
+        ${circles}
+        ${labels}
+    </svg>`;
+}
+
+function renderTypeDistribution(items = []) {
+    const total = items.reduce((sum, item) => sum + safeCount(item.count), 0) || 1;
+    if (!items.length) return '<div class="dashboard-muted">暂无类型统计</div>';
+
+    const typeMapping = {
+        'text': 0,
+        'image': 1,
+        'other': 2
+    };
+
+    return items.map((item, idx) => {
+        const count = safeCount(item.count);
+        const pct = Math.round((count / total) * 1000) / 10;
+        const colorIdx = typeMapping[item.type] !== undefined ? typeMapping[item.type] : (idx % 5);
+        return `<div class="dashboard-type-row">
+            <div class="dashboard-type-meta"><span>${escapeAttr(item.name || item.type)}</span><span>${count.toLocaleString()} · ${pct}%</span></div>
+            <div class="dashboard-type-bar"><span class="dashboard-type-fill dashboard-type-${colorIdx}" style="width:${Math.max(pct, 2)}%"></span></div>
+        </div>`;
+    }).join('');
+}
+
+function dashboardOpenSession(sessionId, name = '', messageType = '') {
+    const sid = safeText(sessionId);
+    if (!sid) return;
+    const meta = sessionsById.get(sid) || {};
+    selectSession(sid, name || meta.name || meta.session_name || sid, messageType || meta.message_type || '');
+}
+
+function attachTrendTooltipHandlers(panel) {
+    const dots = panel.querySelectorAll('.dashboard-dot');
+    let tooltip = document.getElementById('dashboardTrendTooltip');
+    if (!tooltip) {
+        tooltip = document.createElement('div');
+        tooltip.id = 'dashboardTrendTooltip';
+        tooltip.style.cssText = 'position: absolute; display: none; pointer-events: none; z-index: 1000; background: rgba(15, 23, 42, 0.95); border: 1px solid var(--glass-border); border-radius: 8px; padding: 6px 12px; font-size: 0.75rem; color: white; box-shadow: 0 4px 16px rgba(0,0,0,0.5); transition: opacity 0.15s ease; transform: translate(-50%, -100%); font-family: inherit; line-height: 1.4; opacity: 0;';
+        panel.appendChild(tooltip);
+    }
+
+    dots.forEach(dot => {
+        const show = () => {
+            const date = dot.getAttribute('data-date');
+            const val = parseInt(dot.getAttribute('data-value'), 10) || 0;
+            tooltip.innerHTML = `<div style="font-weight: 700; color: var(--primary-light); margin-bottom: 2px;">${date}</div><div style="font-weight: 600;">${val.toLocaleString()} 条消息</div>`;
+
+            tooltip.style.display = 'block';
+            tooltip.style.opacity = '1';
+
+            const panelRect = panel.getBoundingClientRect();
+            const dotRect = dot.getBoundingClientRect();
+
+            const left = dotRect.left - panelRect.left + dotRect.width / 2;
+            const top = dotRect.top - panelRect.top - 6;
+
+            tooltip.style.left = `${left}px`;
+            tooltip.style.top = `${top}px`;
+        };
+
+        const hide = () => {
+            tooltip.style.opacity = '0';
+            tooltip.style.display = 'none';
+        };
+
+        dot.addEventListener('mouseenter', show);
+        dot.addEventListener('click', show);
+        dot.addEventListener('mouseleave', hide);
+    });
+}
+
+function attachDashboardHandlers(root) {
+    root.querySelectorAll('[data-dashboard-range]').forEach(btn => {
+        btn.addEventListener('click', () => fetchDashboard(btn.dataset.dashboardRange || '30d'));
+    });
+    root.querySelectorAll('[data-dashboard-session]').forEach(el => {
+        el.addEventListener('click', () => dashboardOpenSession(el.dataset.dashboardSession, el.dataset.dashboardName, el.dataset.dashboardType));
+    });
+
+    const trendPanel = root.querySelector('.dashboard-panel-wide');
+    if (trendPanel) {
+        attachTrendTooltipHandlers(trendPanel);
+    }
+}
+
+function getPerfBarPercent(ms, total) {
+    if (!total || total <= 0) return 0;
+    return Math.min(100, Math.max(0, (ms / total) * 100));
+}
+
+function renderPerformanceChart(perf = {}, summary = {}) {
+    const isHit = !!perf.cache_hit;
+    const dbSize = typeof perf.db_size_mb === 'number' ? perf.db_size_mb : 0;
+    const totalTime = typeof perf.total_db_time_ms === 'number' ? perf.total_db_time_ms : 0;
+
+    const timeSummary = typeof perf.time_summary_ms === 'number' ? perf.time_summary_ms : 0;
+    const timeType = typeof perf.time_type_ms === 'number' ? perf.time_type_ms : 0;
+    const timeTrend = typeof perf.time_trend_ms === 'number' ? perf.time_trend_ms : 0;
+    const timeGroups = typeof perf.time_groups_ms === 'number' ? perf.time_groups_ms : 0;
+
+    const pctSummary = getPerfBarPercent(timeSummary, totalTime);
+    const pctType = getPerfBarPercent(timeType, totalTime);
+    const pctTrend = getPerfBarPercent(timeTrend, totalTime);
+    const pctGroups = getPerfBarPercent(timeGroups, totalTime);
+
+    // Calculate throughput: messages per millisecond (total_messages / total_time)
+    const totalMsgs = typeof summary.total_messages === 'number' ? summary.total_messages : 0;
+    const speed = totalTime > 0 ? Math.round(totalMsgs / totalTime) : 0;
+    const throughputHtml = `<span class="perf-kpi-value">${speed.toLocaleString()} <span class="perf-kpi-unit">条/ms</span></span>`;
+
+    return `
+        <div class="perf-container animate-fade">
+            <!-- KPI Cards Row -->
+            <div class="perf-kpi-row">
+                <div class="perf-kpi-card">
+                    <span class="perf-kpi-label">数据库大小</span>
+                    <span class="perf-kpi-value">${dbSize.toFixed(2)} <span class="perf-kpi-unit">MB</span></span>
+                </div>
+                <div class="perf-kpi-card">
+                    <span class="perf-kpi-label">SQL 查询总耗时</span>
+                    <span class="perf-kpi-value ${isHit ? 'cache-hit-text' : ''}">${totalTime.toFixed(2)} <span class="perf-kpi-unit">ms</span></span>
+                </div>
+                <div class="perf-kpi-card">
+                    <span class="perf-kpi-label">单次数据检索吞吐率</span>
+                    ${throughputHtml}
+                </div>
+            </div>
+
+            <!-- SQL Subquery Performance Bar Grid -->
+            <div class="perf-bars-grid">
+                <div class="perf-bar-row">
+                    <div class="perf-bar-meta">
+                        <span class="perf-bar-name">📊 全局概览统计查询 (Summary)</span>
+                        <span class="perf-bar-time">${timeSummary.toFixed(2)} ms</span>
+                    </div>
+                    <div class="perf-bar-track">
+                        <div class="perf-bar-fill fill-summary" style="width: ${pctSummary}%"></div>
+                    </div>
+                </div>
+
+                <div class="perf-bar-row">
+                    <div class="perf-bar-meta">
+                        <span class="perf-bar-name">📈 消息类型分布统计 (Type Dist)</span>
+                        <span class="perf-bar-time">${timeType.toFixed(2)} ms</span>
+                    </div>
+                    <div class="perf-bar-track">
+                        <div class="perf-bar-fill fill-type" style="width: ${pctType}%"></div>
+                    </div>
+                </div>
+
+                <div class="perf-bar-row">
+                    <div class="perf-bar-meta">
+                        <span class="perf-bar-name">📉 活跃度趋势序列分析 (Trend)</span>
+                        <span class="perf-bar-time">${timeTrend.toFixed(2)} ms</span>
+                    </div>
+                    <div class="perf-bar-track">
+                        <div class="perf-bar-fill fill-trend" style="width: ${pctTrend}%"></div>
+                    </div>
+                </div>
+
+                <div class="perf-bar-row">
+                    <div class="perf-bar-meta">
+                        <span class="perf-bar-name">👥 活跃群聊排行统计 (Top Groups)</span>
+                        <span class="perf-bar-time">${timeGroups.toFixed(2)} ms</span>
+                    </div>
+                    <div class="perf-bar-track">
+                        <div class="perf-bar-fill fill-groups" style="width: ${pctGroups}%"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `;
+}
+
+function renderDashboard(data) {
+    const list = document.getElementById('messageList');
+    if (!list) return;
+    const loadMore = document.getElementById('loadMoreWrap');
+    if (loadMore) loadMore.style.display = 'none';
+
+    const summary = data?.summary || {};
+    const trend = data?.activity_trend || [];
+    const topGroups = data?.top_groups || [];
+    const dist = data?.message_type_distribution || [];
+    const perf = data?.performance || {};
+    const currentRange = data?.range || '30d';
+
+    const rangeButtons = [['1d', '24小时'], ['7d', '7天'], ['30d', '30天']]
+        .map(([key, label]) => `<button class="dashboard-range-btn ${currentRange === key ? 'active' : ''}" data-dashboard-range="${key}">${label}</button>`).join('');
+
+    const topGroupHtml = topGroups.length ? topGroups.map((g, idx) => `
+        <button class="dashboard-list-item dashboard-clickable" type="button" data-dashboard-session="${escapeAttr(g.session_id)}" data-dashboard-name="${escapeAttr(g.name)}" data-dashboard-type="${escapeAttr(g.message_type)}">
+            <span class="dashboard-rank">${idx + 1}</span>
+            <span class="dashboard-item-main"><strong>${escapeAttr(g.name)}</strong><small>${escapeAttr(g.last_msg || '暂无消息预览')}</small></span>
+            <span class="dashboard-item-count">${formatCompactNumber(g.message_count)}</span>
+        </button>
+    `).join('') : '<div class="dashboard-muted">暂无群聊排行</div>';
+
+    list.innerHTML = `
+        <section class="dashboard-view animate-fade">
+            <div class="dashboard-hero">
+                <div>
+                    <p class="dashboard-kicker">Chat Archive Overview</p>
+                    <h2>归档总览</h2>
+                    <p>从全局视角查看消息规模、活跃趋势、群排行与 SQL 性能分析。</p>
+                </div>
+                <div class="dashboard-cache-note">${data?.cached ? '缓存数据' : '实时生成'} · ${data?.cache_ttl || 30}s TTL</div>
+            </div>
+            <div class="dashboard-summary-grid">
+                <div class="dashboard-card"><span>总消息数</span><strong>${formatCompactNumber(summary.total_messages)}</strong></div>
+                <div class="dashboard-card"><span>今日消息</span><strong>${formatCompactNumber(summary.today_messages)}</strong></div>
+                <div class="dashboard-card"><span>总会话数</span><strong>${formatCompactNumber(summary.total_sessions)}</strong></div>
+                <div class="dashboard-card"><span>总图片数</span><strong>${formatCompactNumber(summary.total_images)}</strong></div>
+                <div class="dashboard-card"><span>总视频数</span><strong>${formatCompactNumber(summary.total_videos)}</strong></div>
+            </div>
+            <div class="dashboard-grid-layout">
+                <div class="dashboard-panel dashboard-panel-wide">
+                    <div class="dashboard-panel-header"><h3>活跃度趋势</h3><div class="dashboard-range-group" id="dashboardRangeGroup">${rangeButtons}</div></div>
+                    <div id="dashboardTrendWrapper" style="width: 100%; transition: opacity 0.15s ease;">${renderDashboardTrendSvg(trend)}</div>
+                </div>
+                <div class="dashboard-panel">
+                    <div class="dashboard-panel-header"><h3>消息类型分布</h3></div>
+                    ${renderTypeDistribution(dist)}
+                </div>
+                <div class="dashboard-panel">
+                    <div class="dashboard-panel-header"><h3>群活跃排行</h3></div>
+                    <div class="dashboard-list">${topGroupHtml}</div>
+                </div>
+                <div class="dashboard-panel dashboard-panel-wide">
+                    <div class="dashboard-panel-header">
+                        <h3>⚡ 缓存与 SQL 查询性能分析</h3>
+                        ${perf.cache_hit ? '<span class="perf-cache-badge cache-hit">🚀 CACHE HIT</span>' : '<span class="perf-cache-badge cache-miss">🔍 DATABASE QUERY</span>'}
+                    </div>
+                    ${renderPerformanceChart(perf, summary)}
+                </div>
+            </div>
+        </section>`;
+    attachDashboardHandlers(list);
+}
+
+async function fetchDashboard(range = '30d') {
+    try {
+        const trendWrapper = document.getElementById('dashboardTrendWrapper');
+        const rangeGroup = document.getElementById('dashboardRangeGroup');
+        const isAlreadyVisible = trendWrapper && rangeGroup;
+
+        if (isAlreadyVisible) {
+            trendWrapper.style.opacity = '0.5';
+        }
+
+        const data = await fetchAPI(`/api/dashboard?range=${encodeURIComponent(range)}&recent_limit=12`);
+        if (!data.success) return;
+
+        if (isAlreadyVisible) {
+            const trend = data.data?.activity_trend || [];
+            const currentRange = data.data?.range || range;
+
+            // 1. Update range buttons
+            const rangeButtons = [['1d', '24小时'], ['7d', '7天'], ['30d', '30天']]
+                .map(([key, label]) => `<button class="dashboard-range-btn ${currentRange === key ? 'active' : ''}" data-dashboard-range="${key}">${label}</button>`).join('');
+            rangeGroup.innerHTML = rangeButtons;
+
+            // 2. Update trend Svg
+            trendWrapper.innerHTML = renderDashboardTrendSvg(trend);
+            trendWrapper.style.opacity = '1';
+
+            // 3. Re-attach click events to the new range buttons
+            rangeGroup.querySelectorAll('[data-dashboard-range]').forEach(btn => {
+                btn.addEventListener('click', () => fetchDashboard(btn.dataset.dashboardRange || '30d'));
+            });
+
+            // 4. Re-attach trend tooltip handlers
+            const trendPanel = document.querySelector('.dashboard-panel-wide');
+            if (trendPanel) {
+                attachTrendTooltipHandlers(trendPanel);
+            }
+        } else {
+            renderDashboard(data.data);
+        }
+    } catch (e) {
+        console.error(e);
+        const list = document.getElementById('messageList');
+        if (list && !document.getElementById('dashboardTrendWrapper')) {
+            list.innerHTML = '<div class="empty-state"><p style="font-weight:600;">Dashboard 加载失败</p><p>请稍后刷新或检查后端日志。</p></div>';
+        }
+    }
+}
+
+
+function updateActiveSessionHeader() {
+    const header = document.getElementById('activeSessionId');
+    const searchInput = document.getElementById('searchInput');
+    if (!header) return;
+    if (!activeSessionId) {
+        const keyword = searchInput ? searchInput.value.trim() : '';
+        if (keyword) {
+            header.innerHTML = `<div class="active-session-title">🔍 全局搜索: "${escapeAttr(keyword)}"</div><div class="active-session-details"><span class="active-session-chip" style="cursor:pointer;" onclick="document.getElementById('searchInput').value=''; showDashboard();">返回总览 Dashboard</span></div>`;
+        } else {
+            header.innerHTML = '<div class="active-session-title">📊 Archive Dashboard</div><div class="active-session-details"><span class="active-session-chip">全局总览</span><span class="active-session-chip">点击会话进入回放</span></div>';
+        }
+        if (searchInput) searchInput.placeholder = '全局搜索消息...';
+    } else {
+        const meta = sessionsById.get(activeSessionId) || {};
+        const title = meta.name || meta.session_name || activeSessionId;
+        header.innerText = title;
+        if (searchInput) searchInput.placeholder = '搜索当前会话...';
+    }
+}
+
+function showDashboard(options = {}) {
+    const searchInput = document.getElementById('searchInput');
+    if (searchInput) searchInput.value = '';
+    activeSessionId = '';
+    activeUserId = '';
+    activeMsgType = '';
+    currentPage = 1;
+    nextCursor = 0;
+    isHistoryLoading = false;
+    memberRequestSeq += 1;
+    rankRequestSeq += 1;
+    window.userMap = {};
+    window.globalTopUsers = [];
+
+    const list = document.getElementById('messageList');
+    if (list) {
+        try { listObserver.unobserve(list); } catch (_) { }
+        list.scrollTop = 0;
+    }
+    document.querySelectorAll('.session-item').forEach(el => {
+        if (el.classList.contains('dashboard-nav')) el.classList.add('active');
+        else el.classList.remove('active');
+    });
+    document.querySelectorAll('.sidebar-sub-menu').forEach(el => el.remove());
+    const loadMore = document.getElementById('loadMoreWrap');
+    if (loadMore) loadMore.style.display = 'none';
+    if (scrollBtn) scrollBtn.style.display = 'none';
+    updateActiveSessionHeader();
+    if (!options.skipUrl) updateDashboardUrl(options.replaceUrl === true);
+    fetchDashboard(options.range || '30d');
 }
 
 function findCqJsonEnd(text, dataStart) {
@@ -597,7 +994,7 @@ function formatMsg(text) {
         let name = window.userMap && window.userMap[qq] ? window.userMap[qq] : qq;
         const safeName = escapeAttr(name);
         return `<span class="msg-tag" style="padding:2px 8px; gap:4px; display:inline-flex; align-items:center; color:var(--text-main); background:rgba(255,255,255,0.1);">
-            <img src="${getAvatarUrl(qq)}" onerror="this.src=getAvatarUrl('fallback')" style="width:16px; height:16px; border-radius:50%; object-fit:cover;" /> 
+            <img src="${getAvatarUrl(qq)}" onerror="this.src=getAvatarUrl('fallback')" style="width:16px; height:16px; border-radius:50%; object-fit:cover;" />
             @${safeName}
         </span>`;
     });
@@ -754,6 +1151,14 @@ function createMessageBubble(msg) {
         footer.appendChild(recalled);
     }
 
+    if (msg.message_truncated) {
+        const truncated = document.createElement('span');
+        truncated.className = 'msg-tag';
+        truncated.title = `原始长度 ${safeCount(msg.message_length).toLocaleString()} 字符`;
+        truncated.textContent = '已截断';
+        footer.appendChild(truncated);
+    }
+
     const time = document.createElement('span');
     time.textContent = formatTime(msg.timestamp).split(' ')[1] || '';
     footer.appendChild(time);
@@ -770,6 +1175,18 @@ async function fetchSessions() {
             const list = document.getElementById('sessionList');
             list.innerHTML = '';
 
+            const dashboardItem = document.createElement('div');
+            dashboardItem.className = `session-item dashboard-nav ${!activeSessionId ? 'active' : ''}`;
+            dashboardItem.innerHTML = `
+                <div class="dashboard-nav-icon">📊</div>
+                <div class="session-info">
+                    <div class="session-name">总览 Dashboard</div>
+                    <div class="session-last">整体数据、趋势与最近消息</div>
+                </div>`;
+            dashboardItem.onclick = () => showDashboard();
+            list.appendChild(dashboardItem);
+
+            sessionsById.clear();
             const groups = {
                 'group': { name: '群组会话', items: [] },
                 'friend': { name: '个人私聊', items: [] },
@@ -782,13 +1199,13 @@ async function fetchSessions() {
                 if (mt.includes('group')) category = 'group';
                 else if (mt.includes('friend')) category = 'friend';
 
-                // 强制修正展示名称：如果还是技术 ID，且我们知道是群还是私聊，做个简单的清理
                 if (s.name === s.session_id && s.session_id.includes(':')) {
                     const parts = s.session_id.split(':');
                     const id = parts[parts.length - 1];
                     s.name = (category === 'group' ? '群聊: ' : '私聊: ') + id;
                 }
 
+                sessionsById.set(s.session_id, { ...s });
                 if (groups[category]) groups[category].items.push(s);
             });
 
@@ -812,7 +1229,6 @@ async function fetchSessions() {
 
                 const content = document.createElement('div');
                 content.className = 'category-content';
-
                 header.onclick = () => toggleCategory(header, content);
 
                 groupData.items.forEach((s, idx) => {
@@ -827,19 +1243,14 @@ async function fetchSessions() {
 
                     const avatarUrl = escapeAttr(s.avatar || getAvatarUrl('fallback'));
                     const lastTime = safeCount(s.last_time);
-                    const lastDate = lastTime
-                        ? new Date(lastTime * 1000).toLocaleDateString()
-                        : '';
+                    const lastDate = lastTime ? new Date(lastTime * 1000).toLocaleDateString() : '';
                     item.innerHTML = `
                         <img class="session-avatar" src="${avatarUrl}" onerror="this.src=getAvatarUrl('fallback')" />
                         <div class="session-info">
-                            <div class="session-meta">
-                                <span>${escapeAttr(lastDate)}</span>
-                            </div>
+                            <div class="session-meta"><span>${escapeAttr(lastDate)}</span></div>
                             <div class="session-name"></div>
                             <div class="session-last"></div>
-                        </div>
-                    `;
+                        </div>`;
                     item.querySelector('.session-name').textContent = safeText(s.name);
                     item.querySelector('.session-last').textContent = formatSessionPreview(s.last_msg);
                     content.appendChild(item);
@@ -849,16 +1260,22 @@ async function fetchSessions() {
                 list.appendChild(content);
             });
 
-            // 自动选中第一个会话
-            const firstSession = data.data[0];
-            if (firstSession) {
-                setTimeout(() => selectSession(firstSession.session_id, firstSession.name, firstSession.message_type), 100);
+            const desiredSessionId = getDesiredSessionId();
+            if (desiredSessionId) {
+                const targetSession = data.data.find(s => s.session_id === desiredSessionId);
+                if (targetSession) {
+                    setTimeout(() => selectSession(targetSession.session_id, targetSession.name, targetSession.message_type, { replaceUrl: true }), 100);
+                } else {
+                    setTimeout(() => selectSession(desiredSessionId, desiredSessionId, '', { replaceUrl: true }), 100);
+                }
+            } else {
+                setTimeout(() => showDashboard({ replaceUrl: true }), 100);
             }
         }
     } catch (e) { console.error(e); }
 }
 
-async function selectSession(sessionId, name, msgType) {
+async function selectSession(sessionId, name, msgType, options = {}) {
     if (activeSessionId === sessionId && activeUserId === '') {
         if (window.innerWidth <= 1400) {
             closeAllPanels();
@@ -872,6 +1289,7 @@ async function selectSession(sessionId, name, msgType) {
     }
     activeMsgType = msgType || '';
     activeSessionId = sessionId;
+    updateSessionUrl(sessionId, options.replaceUrl === true);
     memberRequestSeq += 1;
     rankRequestSeq += 1;
     memberOffset = 0;
@@ -884,7 +1302,9 @@ async function selectSession(sessionId, name, msgType) {
     rankMemberUsers = [];
     window.globalTopUsers = [];
     memberSearchKeyword = '';
-    document.getElementById('activeSessionId').innerText = sessionId;
+    const storedMeta = sessionsById.get(sessionId) || {};
+    sessionsById.set(sessionId, { ...storedMeta, session_id: sessionId, name: name || storedMeta.name || sessionId, message_type: msgType || storedMeta.message_type || '' });
+    updateActiveSessionHeader();
 
     document.querySelectorAll('.session-item').forEach(el => {
         if (el.dataset.sessionId === sessionId) el.classList.add('active');
@@ -1351,7 +1771,7 @@ function getPrependAnchor(list) {
     return null;
 }
 
-function stabilizePrependAnchor(list, anchorEl, anchorTop, attempts = 5) {
+function stabilizePrependAnchor(list, anchorEl, anchorTop, attempts = 2) {
     restorePrependAnchor(list, anchorEl, anchorTop);
     if (attempts <= 1) return;
     requestAnimationFrame(() => stabilizePrependAnchor(list, anchorEl, anchorTop, attempts - 1));
@@ -1382,6 +1802,7 @@ function pruneMessageDom(list, removeFromBottom = false) {
 
 // 监听容器高度变化（如图片加载），自动保持底部
 const listObserver = new ResizeObserver(entries => {
+    if (isHistoryLoading) return; // 正在加载历史记录时，禁止触发自动滚动，避免高度突变导致闪跳/误触底
     const list = document.getElementById('messageList');
     if (!list) return;
 
@@ -1393,21 +1814,45 @@ const listObserver = new ResizeObserver(entries => {
 });
 
 async function fetchHistory(append = false) {
-    if (!activeSessionId) return;
+    const keyword = document.getElementById('searchInput').value.trim();
+    if (!activeSessionId && !keyword) return;
     if (isHistoryLoading) return;
     isHistoryLoading = true;
 
+    updateActiveSessionHeader();
+
     const list = document.getElementById('messageList');
-    const loadMoreBtn = document.getElementById('loadMoreBtn');
-    if (append && loadMoreBtn) loadMoreBtn.disabled = true;
     if (!append) {
         currentPage = 1;
         nextCursor = 0;
+        // 清除 dashboard 视图（innerHTML 生成的内容不含 loadMoreWrap）
+        list.querySelectorAll('.dashboard-view').forEach(el => el.remove());
+        // 确保 loadMoreWrap 存在（dashboard 的 innerHTML 可能已销毁它）
+        if (!document.getElementById('loadMoreWrap')) {
+            const wrap = document.createElement('div');
+            wrap.id = 'loadMoreWrap';
+            wrap.style.cssText = 'display: none; padding: 1rem 0; text-align: center; margin-bottom: 1rem;';
+            const btn = document.createElement('button');
+            btn.className = 'primary-btn';
+            btn.id = 'loadMoreBtn';
+            btn.type = 'button';
+            btn.tabIndex = -1;
+            btn.style.cssText = 'width: auto; padding: 0.4rem 2rem; background: rgba(255,255,255,0.05); border: 1px solid var(--glass-border); color: var(--text-sub); border-radius: 100px; font-size: 0.8rem; cursor: pointer; transition: all 0.2s;';
+            btn.textContent = '⇧ 加载更早的记录';
+            btn.addEventListener('pointerdown', (e) => e.preventDefault());
+            btn.addEventListener('mousedown', (e) => e.preventDefault());
+            btn.addEventListener('pointerup', (e) => {
+                if (e.pointerType !== 'mouse') { e.preventDefault(); handleLoadMore(); }
+            });
+            btn.onclick = handleLoadMore;
+            wrap.appendChild(btn);
+            list.prepend(wrap);
+        }
         // 开始监听高度变化
         listObserver.observe(list);
     }
-
-    const keyword = document.getElementById('searchInput').value;
+    const loadMoreBtn = document.getElementById('loadMoreBtn');
+    if (append && loadMoreBtn) loadMoreBtn.disabled = true;
 
     try {
         let url = `/api/history?session_id=${encodeURIComponent(activeSessionId)}&user_id=${encodeURIComponent(activeUserId)}&keyword=${encodeURIComponent(keyword)}&page=${currentPage}&limit=${limit}`;
@@ -1431,7 +1876,8 @@ async function fetchHistory(append = false) {
                     <p style="font-weight:600;">未找到相关记录</p>
                 `;
                 list.appendChild(empty);
-                document.getElementById('loadMoreWrap').style.display = 'none';
+                const loadMoreWrap = document.getElementById('loadMoreWrap');
+                if (loadMoreWrap) loadMoreWrap.style.display = 'none';
                 return;
             }
 
@@ -1439,6 +1885,7 @@ async function fetchHistory(append = false) {
             const messages = [...data.data].reverse();
 
             let renderUserId = null;
+            let renderSessionId = null;
             let renderDateStr = null;
             let renderMessageCard = null;
 
@@ -1457,6 +1904,7 @@ async function fetchHistory(append = false) {
                     fragment.appendChild(divider);
                     renderDateStr = dateStr;
                     renderUserId = null; // Next message forces new group wrapper
+                    renderSessionId = null;
                 }
 
                 const bubble = createMessageBubble(msg);
@@ -1468,8 +1916,9 @@ async function fetchHistory(append = false) {
                     systemMsg.innerHTML = `<span>${formatMsg(msg.message)}</span>`;
                     fragment.appendChild(systemMsg);
                     renderUserId = null; // Break grouping
+                    renderSessionId = null;
                     renderMessageCard = null;
-                } else if (renderUserId === msg.user_id && renderMessageCard) {
+                } else if (renderUserId === msg.user_id && renderMessageCard && (activeSessionId !== '' || renderSessionId === msg.session_id)) {
                     const bubbleList = renderMessageCard.querySelector('.msg-bubble-list');
                     bubbleList.appendChild(bubble);
                 } else {
@@ -1481,7 +1930,7 @@ async function fetchHistory(append = false) {
                         </div>
                         <div class="content-col">
                             <div class="msg-author">
-                                <span class="author-name"></span> 
+                                <span class="author-name"></span>
                                 <span class="author-id"></span>
                             </div>
                             <div class="msg-bubble-list"></div>
@@ -1489,10 +1938,29 @@ async function fetchHistory(append = false) {
                     `;
                     group.querySelector('.author-name').textContent = safeText(msg.sender_name);
                     group.querySelector('.author-id').textContent = `#${safeText(msg.user_id)}`;
+
+                    if (!activeSessionId) {
+                        const displaySessionName = msg.session_name || msg.session_id || '未知会话';
+                        const sessionEl = document.createElement('span');
+                        sessionEl.className = 'author-session';
+                        sessionEl.textContent = ` @ ${displaySessionName}`;
+                        sessionEl.title = '点击进入会话';
+                        sessionEl.style.cssText = 'color: var(--text-sub); font-size: 0.75rem; margin-left: 6px; cursor: pointer; text-decoration: underline; opacity: 0.8; transition: opacity 0.2s;';
+                        sessionEl.onmouseover = () => { sessionEl.style.opacity = '1'; };
+                        sessionEl.onmouseout = () => { sessionEl.style.opacity = '0.8'; };
+                        sessionEl.onclick = (e) => {
+                            e.stopPropagation();
+                            document.getElementById('searchInput').value = '';
+                            selectSession(msg.session_id, msg.session_name || msg.session_id, msg.message_type || '');
+                        };
+                        group.querySelector('.msg-author').appendChild(sessionEl);
+                    }
+
                     group.querySelector('.msg-bubble-list').appendChild(bubble);
                     fragment.appendChild(group);
                     renderMessageCard = group;
                     renderUserId = msg.user_id;
+                    renderSessionId = msg.session_id;
                 }
             });
 
@@ -1513,7 +1981,7 @@ async function fetchHistory(append = false) {
                 pruneMessageDom(list, true);
                 stabilizePrependAnchor(list, anchorEl, anchorTop);
             } else {
-                loadMoreEl.style.display = hasMore ? 'block' : 'none';
+                if (loadMoreEl) loadMoreEl.style.display = hasMore ? 'block' : 'none';
                 list.appendChild(fragment);
 
                 // 确保底部有一个永久锚点
@@ -1552,6 +2020,11 @@ async function fetchStats() {
 }
 
 function handleSearch() {
+    const keyword = document.getElementById('searchInput').value.trim();
+    if (!activeSessionId && !keyword) {
+        showDashboard();
+        return;
+    }
     currentPage = 1;
     fetchHistory();
 }
@@ -1685,6 +2158,17 @@ function closeAllPanels() {
     if (analysis) analysis.classList.remove('open');
     if (overlay) overlay.classList.remove('active');
 }
+
+window.addEventListener('popstate', () => {
+    const sessionId = getDesiredSessionId();
+    if (sessionId) {
+        const meta = sessionsById.get(sessionId);
+        if (meta) selectSession(meta.session_id, meta.name, meta.message_type, { replaceUrl: true });
+        else selectSession(sessionId, sessionId, '', { replaceUrl: true });
+    } else {
+        showDashboard({ skipUrl: true });
+    }
+});
 
 document.addEventListener('DOMContentLoaded', () => {
     initApp();

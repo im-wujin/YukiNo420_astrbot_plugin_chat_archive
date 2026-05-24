@@ -58,7 +58,7 @@ class Database:
         raise NotImplementedError
 
 class SQLiteConnectionPool:
-    def __init__(self, db_path, max_connections=5):
+    def __init__(self, db_path, max_connections=10):
         self.db_path = db_path
         self.max_connections = max_connections
         self.pool = queue.Queue(max_connections)
@@ -181,6 +181,24 @@ def _load_sqlite_journal_mode() -> str:
         mode = "WAL"
     return mode
 
+
+def _load_sqlite_pool_size() -> int:
+    value = os.environ.get("ARCHIVE_SQLITE_MAX_CONNECTIONS", "").strip()
+    if not value:
+        config_path = _get_config_path()
+        if config_path.exists():
+            try:
+                with open(config_path, "r", encoding="utf-8-sig") as f:
+                    data = json.load(f)
+                    value = str(data.get("basic", {}).get("sqlite_max_connections", "")).strip()
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Failed to read sqlite pool size from config: {e}")
+    try:
+        pool_size = int(value or 10)
+    except (TypeError, ValueError):
+        pool_size = 10
+    return max(2, min(pool_size, 64))
+
 DB_PATH = _load_db_path()
 
 _POOL = None
@@ -191,7 +209,7 @@ def get_connection_pool():
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
-                _POOL = SQLiteConnectionPool(DB_PATH)
+                _POOL = SQLiteConnectionPool(DB_PATH, max_connections=_load_sqlite_pool_size())
     return _POOL
 
 
@@ -653,6 +671,67 @@ def migrate_v4(db):
     if not column_exists(db, "chat_history", "is_recalled"):
         db.execute("ALTER TABLE chat_history ADD COLUMN is_recalled INTEGER DEFAULT 0;")
 
+def migrate_v5(db):
+    """Add additive media flags for fast dashboard aggregates.
+
+    Defaults keep all existing INSERT statements compatible. Existing rows are
+    backfilled from CQ codes once the columns exist.
+    """
+    added_any = False
+    if not column_exists(db, "chat_history", "has_image"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN has_image INTEGER DEFAULT 0;")
+        added_any = True
+    if not column_exists(db, "chat_history", "has_video"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN has_video INTEGER DEFAULT 0;")
+        added_any = True
+    if not column_exists(db, "chat_history", "msg_kind"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN msg_kind TEXT DEFAULT 'text';")
+        added_any = True
+
+    if added_any:
+        db.execute('''UPDATE chat_history
+            SET has_image = CASE WHEN message LIKE '%[CQ:image%' THEN 1 ELSE COALESCE(has_image, 0) END,
+                has_video = CASE WHEN message LIKE '%[CQ:video%' THEN 1 ELSE COALESCE(has_video, 0) END,
+                msg_kind = CASE
+                    WHEN message LIKE '%[CQ:image%' THEN 'image'
+                    WHEN message LIKE '%[CQ:video%' THEN 'video'
+                    WHEN message LIKE '%[CQ:record%' THEN 'record'
+                    WHEN message LIKE '%[CQ:file%' THEN 'file'
+                    WHEN message LIKE '%[CQ:%' THEN 'other'
+                    ELSE COALESCE(NULLIF(msg_kind, ''), 'text')
+                END
+        ''')
+
+def ensure_media_flags(db):
+    """Create indexes/triggers for dashboard media flags if schema supports them."""
+    if not all(column_exists(db, "chat_history", col) for col in ("has_image", "has_video", "msg_kind")):
+        return
+
+    db.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_has_image_true ON chat_history(has_image) WHERE has_image = 1;")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_has_video_true ON chat_history(has_video) WHERE has_video = 1;")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_chat_history_msg_kind ON chat_history(msg_kind);")
+
+    # Keep rows inserted by old callers correct without changing their INSERT
+    # column list. Plain text rows keep DEFAULT values and avoid this UPDATE.
+    db.execute("DROP TRIGGER IF EXISTS trg_chat_history_media_flags_insert;")
+    db.execute('''CREATE TRIGGER trg_chat_history_media_flags_insert
+    AFTER INSERT ON chat_history
+    WHEN NEW.message LIKE '%[CQ:%'
+    BEGIN
+        UPDATE chat_history
+        SET has_image = CASE WHEN NEW.message LIKE '%[CQ:image%' THEN 1 ELSE COALESCE(NEW.has_image, 0) END,
+            has_video = CASE WHEN NEW.message LIKE '%[CQ:video%' THEN 1 ELSE COALESCE(NEW.has_video, 0) END,
+            msg_kind = CASE
+                WHEN NEW.message LIKE '%[CQ:image%' THEN 'image'
+                WHEN NEW.message LIKE '%[CQ:video%' THEN 'video'
+                WHEN NEW.message LIKE '%[CQ:record%' THEN 'record'
+                WHEN NEW.message LIKE '%[CQ:file%' THEN 'file'
+                WHEN NEW.message LIKE '%[CQ:%' THEN 'other'
+                ELSE COALESCE(NEW.msg_kind, 'text')
+            END
+        WHERE id = NEW.id;
+    END;''')
+
 def ensure_session_stats(db):
     """Create and backfill a session summary table without changing chat_history."""
     db.execute('''CREATE TABLE IF NOT EXISTS session_stats (
@@ -666,6 +745,8 @@ def ensure_session_stats(db):
         message_count INTEGER DEFAULT 0
     )''')
     db.execute("CREATE INDEX IF NOT EXISTS idx_session_stats_last_time ON session_stats(last_time DESC);")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_session_stats_message_count ON session_stats(message_count DESC);")
+    db.execute("CREATE INDEX IF NOT EXISTS idx_session_stats_type_count ON session_stats(message_type, message_count DESC);")
 
     # Keep stats current for new writes. Existing installations are backfilled below.
     db.execute("DROP TRIGGER IF EXISTS trg_chat_history_session_stats_insert;")
@@ -767,10 +848,13 @@ def init_db():
                 message_type TEXT,
                 session_name TEXT,
                 msg_id TEXT,
-                is_recalled INTEGER DEFAULT 0
+                is_recalled INTEGER DEFAULT 0,
+                has_image INTEGER DEFAULT 0,
+                has_video INTEGER DEFAULT 0,
+                msg_kind TEXT DEFAULT 'text'
             )''')
             # 将 user_version 置为当前最高迁移版本
-            db.execute("PRAGMA user_version = 4;")
+            db.execute("PRAGMA user_version = 5;")
             db.commit()
         else:
             # 2. 存量数据库：基于 PRAGMA user_version 进行有序增量迁移
@@ -783,6 +867,7 @@ def init_db():
                 (2, migrate_v2),
                 (3, migrate_v3),
                 (4, migrate_v4),
+                (5, migrate_v5),
             ]
 
             for version, migrate_func in migrations:
@@ -790,6 +875,11 @@ def init_db():
                     migrate_func(db)
                     db.execute(f"PRAGMA user_version = {version};")
                     db.commit()
+
+            # v5 is additive/idempotent; this repairs partially migrated schemas
+            # without doing an expensive media LIKE backfill on every startup.
+            if not all(column_exists(db, "chat_history", col) for col in ("has_image", "has_video", "msg_kind")):
+                migrate_v5(db)
 
         # 3. 始终确保必要的高性能索引已创建（幂等）
         # 注: idx_user 和 idx_session 尽管被组合索引覆盖，保留它们是为了兼容旧查询可能只过滤单列时的性能
@@ -800,6 +890,7 @@ def init_db():
         db.execute("CREATE INDEX IF NOT EXISTS idx_user_timestamp ON chat_history(user_id, timestamp);")
         db.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_history(timestamp);")
         db.execute("CREATE INDEX IF NOT EXISTS idx_session_id_desc ON chat_history(session_id, id DESC);")
+        ensure_media_flags(db)
         ensure_session_stats(db)
         db.commit()
     finally:
