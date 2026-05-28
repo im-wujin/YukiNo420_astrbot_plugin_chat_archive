@@ -1,8 +1,8 @@
 # Changelog
 
 ## 1.4.1
-
-
+- Web尝试性支持markdown
+- 修复安全问题
 
 ## 1.4.0
 
