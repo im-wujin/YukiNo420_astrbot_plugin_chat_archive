@@ -165,7 +165,7 @@ class ArchiveMediaCache:
             logger.error(f"Chat Archive: 创建缓存目录失败: {e}")
             return url
 
-        url_hash = hashlib.md5(url.encode("utf-8")).hexdigest()
+        url_hash = hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
 
         async with self._download_locks_guard:
             download_lock = self._download_locks.get(url_hash)

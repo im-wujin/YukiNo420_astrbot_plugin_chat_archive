@@ -62,7 +62,7 @@
                 "type": "string",
                 "description": "数据库文件路径",
                 "default": "",
-                "hint": "自定义 SQLite 数据库文件路径。支持 ~、环境变量和相对路径；相对路径默认基于插件数据目录。也可用 ARCHIVE_DB_PATH 环境变量覆盖。留空则使用默认位置 (data/chat_history.db)。修改后需要重启插件/服务。"
+                "hint": "自定义 SQLite 数据库文件路径。支持 ~、环境变量和相对路径；相对路径默认基于插件数据目录。Docker 部署时请填写容器内路径，宿主机数据库需先挂载到容器。也可用 ARCHIVE_DB_PATH 覆盖。留空则使用默认位置 (data/chat_history.db)。修改后需要重启插件/服务。"
             },
             "sqlite_journal_mode": {
                 "type": "string",

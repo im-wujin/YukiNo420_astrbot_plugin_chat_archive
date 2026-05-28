@@ -584,7 +584,11 @@ class DatabaseManager:
         return {"error": f"不支持的查询类型: {query_type}"}
 
 
+_ALLOWED_TABLES = frozenset({"chat_history", "session_stats", "sqlite_master"})
+
 def column_exists(db, table, column):
+    if table not in _ALLOWED_TABLES:
+        raise ValueError(f"column_exists: disallowed table name '{table}'")
     cursor = db.execute(f"PRAGMA table_info({table});")
     columns = [row["name"] for row in cursor.fetchall()]
     return column in columns

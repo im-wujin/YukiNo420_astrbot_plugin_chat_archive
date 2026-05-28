@@ -221,6 +221,155 @@ function safeCount(value) {
     return Number.isFinite(n) ? n : 0;
 }
 
+function makePrivateToken(prefix, index) {
+    return `\uE000${prefix}_${index}\uE001`;
+}
+
+function escapeHtmlText(value) {
+    const div = document.createElement('div');
+    div.textContent = safeText(value);
+    return div.innerHTML;
+}
+
+function decodeHtmlEntities(value) {
+    const textarea = document.createElement('textarea');
+    textarea.innerHTML = safeText(value);
+    return textarea.value;
+}
+
+function isSafeMarkdownUrl(url) {
+    const normalized = safeText(url).trim();
+    if (!normalized || /[\u0000-\u001F\u007F\s]/.test(normalized)) return false;
+    return /^(https?:\/\/|\/static\/)/i.test(normalized);
+}
+
+function getMarkdownUrl(urlText) {
+    const url = decodeHtmlEntities(urlText).trim();
+    return isSafeMarkdownUrl(url) ? url : '';
+}
+
+function renderMessageMarkdown(escapedText) {
+    const codeTokens = [];
+    const stashCode = html => {
+        const token = makePrivateToken('MD_CODE', codeTokens.length);
+        codeTokens.push(html);
+        return token;
+    };
+    const restoreCode = html => html.replace(/\uE000MD_CODE_(\d+)\uE001/g, (match, index) => codeTokens[Number(index)] ?? match);
+    const renderInline = value => {
+        let html = safeText(value);
+        html = html.replace(/`([^`\n]+)`/g, (match, code) => stashCode(`<code class="msg-md-code">${code}</code>`));
+        html = html.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+        html = html.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+        html = html.replace(/(^|[^\*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+        html = html.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (match, alt, urlText) => {
+            const url = getMarkdownUrl(urlText);
+            if (!url) return match;
+            const safeUrl = escapeAttr(url);
+            const safeAlt = escapeAttr(decodeHtmlEntities(alt));
+            return `<a href="${safeUrl}" target="_blank" rel="noopener noreferrer"><img src="${safeUrl}" class="msg-image msg-md-image" alt="${safeAlt || '图片'}" loading="lazy" onload="this.classList.add('loaded')" onerror="this.parentElement.outerHTML='<span class=\\'msg-tag\\' style=\\'opacity:0.6;\\'>🖼️ [图片]</span>'" /></a>`;
+        });
+        html = html.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+&quot;[^&]*&quot;)?\)/g, (match, label, urlText) => {
+            const url = getMarkdownUrl(urlText);
+            if (!url) return label;
+            return `<a class="msg-md-link" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+        });
+        return html;
+    };
+    const renderInlineLines = value => renderInline(value).replace(/\n/g, '<br>');
+    const lines = safeText(escapedText).replace(/\r\n?/g, '\n').split('\n');
+    const output = [];
+
+    const isBlank = line => line.trim() === '';
+    const isFence = line => /^```[A-Za-z0-9_-]*\s*$/.test(line.trim());
+    const isHr = line => /^(\s*)(-{3,}|\*{3,}|_{3,})\s*$/.test(line);
+    const isHeading = line => /^(#{1,6})\s+(.+)$/.test(line);
+    const isQuote = line => /^\s*&gt;\s?/.test(line);
+    const isUnordered = line => /^\s*[-+*]\s+(.+)$/.test(line);
+    const isOrdered = line => /^\s*\d+\.\s+(.+)$/.test(line);
+    const isBlockStart = line => isFence(line) || isHr(line) || isHeading(line) || isQuote(line) || isUnordered(line) || isOrdered(line);
+    const pushSoftBreak = () => {
+        if (output.length && output[output.length - 1] !== '<br>') output.push('<br>');
+    };
+
+    for (let i = 0; i < lines.length;) {
+        const line = lines[i];
+        if (isBlank(line)) {
+            pushSoftBreak();
+            i += 1;
+            continue;
+        }
+
+        const fenceMatch = line.trim().match(/^```([A-Za-z0-9_-]*)\s*$/);
+        if (fenceMatch) {
+            const codeLines = [];
+            i += 1;
+            while (i < lines.length && !/^```\s*$/.test(lines[i].trim())) {
+                codeLines.push(lines[i]);
+                i += 1;
+            }
+            if (i < lines.length) i += 1;
+            const lang = fenceMatch[1] ? ` data-lang="${escapeAttr(fenceMatch[1])}"` : '';
+            output.push(stashCode(`<pre class="msg-md-codeblock"${lang}><code>${codeLines.join('\n')}</code></pre>`));
+            continue;
+        }
+
+        const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+        if (headingMatch) {
+            const level = headingMatch[1].length;
+            output.push(`<div class="msg-md-heading msg-md-heading-${level}">${renderInline(headingMatch[2].trim())}</div>`);
+            i += 1;
+            continue;
+        }
+
+        if (isHr(line)) {
+            output.push('<hr class="msg-md-hr">');
+            i += 1;
+            continue;
+        }
+
+        if (isQuote(line)) {
+            const quoteLines = [];
+            while (i < lines.length && (isQuote(lines[i]) || isBlank(lines[i]))) {
+                quoteLines.push(isBlank(lines[i]) ? '' : lines[i].replace(/^\s*&gt;\s?/, ''));
+                i += 1;
+            }
+            output.push(`<blockquote class="msg-md-quote">${renderInlineLines(quoteLines.join('\n'))}</blockquote>`);
+            continue;
+        }
+
+        const unorderedMatch = line.match(/^\s*[-+*]\s+(.+)$/);
+        const orderedMatch = line.match(/^\s*\d+\.\s+(.+)$/);
+        if (unorderedMatch || orderedMatch) {
+            const ordered = Boolean(orderedMatch);
+            const tag = ordered ? 'ol' : 'ul';
+            const items = [];
+            while (i < lines.length) {
+                const itemMatch = ordered
+                    ? lines[i].match(/^\s*\d+\.\s+(.+)$/)
+                    : lines[i].match(/^\s*[-+*]\s+(.+)$/);
+                if (!itemMatch) break;
+                items.push(`<li>${renderInlineLines(itemMatch[1].trim())}</li>`);
+                i += 1;
+            }
+            output.push(`<${tag} class="msg-md-list">${items.join('')}</${tag}>`);
+            continue;
+        }
+
+        const paragraph = [];
+        while (i < lines.length && !isBlank(lines[i]) && !isBlockStart(lines[i])) {
+            paragraph.push(lines[i]);
+            i += 1;
+        }
+        output.push(renderInlineLines(paragraph.join('\n')));
+    }
+
+    return {
+        html: output.join(''),
+        restore: restoreCode
+    };
+}
+
 function getImageDisplayStyle(width, height) {
     if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0 || width > 100000 || height > 100000) {
         return '';
@@ -976,6 +1125,89 @@ window.toggleForwardCard = (headerEl) => {
     }
 };
 
+function renderMergedForwardCard(forwardId, rest) {
+    const lines = safeText(rest).replace(/\r\n?/g, '\n').split('\n');
+    const items = [];
+    let currentItem = null;
+    let afterText = '';
+
+    lines.forEach(line => {
+        const lineMatch = line.match(/^\d+\.\s+([^\n:]+):\s*([\s\S]*)$/);
+        if (lineMatch) {
+            if (currentItem) {
+                items.push(currentItem);
+            }
+            currentItem = {
+                sender: lineMatch[1].trim(),
+                content: lineMatch[2].trim()
+            };
+        } else if (currentItem) {
+            currentItem.content += '\n' + line;
+        } else if (line.trim()) {
+            afterText += line + '\n';
+        }
+    });
+    if (currentItem) {
+        items.push(currentItem);
+    }
+
+    let html = '';
+    if (items.length > 0) {
+        const idDisplay = forwardId ? ` (ID: ${escapeAttr(forwardId)})` : '';
+        const itemsHtml = items.map(item => `
+            <div class="msg-forward-item">
+                <span class="msg-forward-sender">${escapeAttr(item.sender)}</span>
+                <span class="msg-forward-text">${formatMsg(item.content)}</span>
+            </div>
+        `).join('');
+
+        html = `
+            <div class="msg-forward-container">
+                <div class="msg-forward-header" onclick="toggleForwardCard(this)">
+                    <div class="msg-forward-title-row">
+                        <span class="msg-forward-icon">📂</span>
+                        <span class="msg-forward-title">合并转发消息</span>
+                        <span class="msg-forward-count">(共 ${items.length} 条消息${idDisplay})</span>
+                    </div>
+                    <span class="msg-forward-toggle-btn">展开 </span>
+                </div>
+                <div class="msg-forward-content collapsed">
+                    ${itemsHtml}
+                </div>
+            </div>
+        `;
+    } else {
+        const idDisplay = forwardId ? ` (未展开, ID: ${escapeAttr(forwardId)})` : ' (未展开)';
+        html = `
+            <div class="msg-forward-container unexpanded">
+                <div class="msg-forward-header" style="cursor: default;">
+                    <div class="msg-forward-title-row">
+                        <span class="msg-forward-icon">📂</span>
+                        <span class="msg-forward-title">合并转发消息</span>
+                        <span class="msg-forward-count">${idDisplay}</span>
+                    </div>
+                </div>
+            </div>
+        `;
+    }
+
+    return { html, afterText };
+}
+
+function replaceMergedForwardCodes(text, replacer) {
+    const value = safeText(text);
+    const index = value.indexOf('[合并转发');
+    if (index === -1) return value;
+
+    const beforeText = value.substring(0, index);
+    const forwardChunk = value.substring(index);
+    const match = forwardChunk.match(/\[合并转发(?:,id=([^\]]*))?\](?:\r?\n)?([\s\S]*)/i);
+    if (!match) return value;
+
+    const replacement = replacer(match[1] || '', match[2] || '');
+    return beforeText + replacement;
+}
+
 function formatMsg(text) {
     if (!text) return "";
 
@@ -988,6 +1220,16 @@ function formatMsg(text) {
         }
     }
 
+    const forwardCards = [];
+    const makeForwardPlaceholder = (forwardId, rest) => {
+        const index = forwardCards.length;
+        const rendered = renderMergedForwardCard(forwardId, rest);
+        forwardCards.push(rendered.html);
+        return makePrivateToken('FORWARD', index) + rendered.afterText;
+    };
+
+    const textWithForwardPlaceholders = replaceMergedForwardCodes(text, makeForwardPlaceholder);
+
     const shareCards = [];
     const makeSharePlaceholder = data => {
         const info = getCqJsonShareInfo(data);
@@ -999,13 +1241,13 @@ function formatMsg(text) {
         return `__CQ_JSON_SHARE_${index}__`;
     };
 
-    const textWithSharePlaceholders = isShareJsonPayload(String(text).trim())
-        ? makeSharePlaceholder(String(text).trim())
-        : replaceCqJsonCodes(text, makeSharePlaceholder);
+    const textWithSharePlaceholders = isShareJsonPayload(String(textWithForwardPlaceholders).trim())
+        ? makeSharePlaceholder(String(textWithForwardPlaceholders).trim())
+        : replaceCqJsonCodes(textWithForwardPlaceholders, makeSharePlaceholder);
 
-    const div = document.createElement('div');
-    div.innerText = textWithSharePlaceholders;
-    let escaped = div.innerHTML;
+    let escaped = escapeHtmlText(textWithSharePlaceholders);
+    const markdown = renderMessageMarkdown(escaped);
+    escaped = markdown.html;
 
     function isSafeUrl(url) {
         if (!url) return false;
@@ -1118,94 +1360,11 @@ function formatMsg(text) {
         return `🛡️ [撤回了一条消息 (ID: <span class="recall-link" data-msg-id="${safeId}">${safeId}</span>)]`;
     });
 
-    // Merged Messages (合并转发) Parsing
-    if (escaped.includes('[合并转发')) {
-        const index = escaped.indexOf('[合并转发');
-        const beforeText = escaped.substring(0, index);
-        const forwardChunk = escaped.substring(index);
+    forwardCards.forEach((html, index) => {
+        escaped = escaped.split(makePrivateToken('FORWARD', index)).join(html);
+    });
 
-        const match = forwardChunk.match(/\[合并转发(?:,id=([^\]]*))?\](?:\n|<br\s*\/?>)?([\s\S]*)/i);
-        if (match) {
-            const forwardId = match[1] || '';
-            const rest = match[2] || '';
-
-            // Normalize <br> tags to standard newlines to support browser innerHTML serialization
-            const normalizedRest = rest.replace(/<br\s*\/?>/gi, '\n');
-            const lines = normalizedRest.split('\n');
-            const items = [];
-            let currentItem = null;
-            let afterText = '';
-
-            lines.forEach(line => {
-                const lineMatch = line.match(/^\d+\.\s+([^\n:]+):\s*([\s\S]*)$/);
-                if (lineMatch) {
-                    if (currentItem) {
-                        items.push(currentItem);
-                    }
-                    currentItem = {
-                        sender: lineMatch[1].trim(),
-                        content: lineMatch[2].trim()
-                    };
-                } else {
-                    if (currentItem) {
-                        currentItem.content += '\n' + line;
-                    } else if (line.trim()) {
-                        afterText += line + '\n';
-                    }
-                }
-            });
-            if (currentItem) {
-                items.push(currentItem);
-            }
-
-            let renderedForward = '';
-            if (items.length > 0) {
-                const idDisplay = forwardId ? ` (ID: ${escapeAttr(forwardId)})` : '';
-                let itemsHtml = '';
-                items.forEach(item => {
-                    itemsHtml += `
-                        <div class="msg-forward-item">
-                            <span class="msg-forward-sender">${escapeAttr(item.sender)}</span>
-                            <span class="msg-forward-text">${item.content}</span>
-                        </div>
-                    `;
-                });
-
-                renderedForward = `
-                    <div class="msg-forward-container">
-                        <div class="msg-forward-header" onclick="toggleForwardCard(this)">
-                            <div class="msg-forward-title-row">
-                                <span class="msg-forward-icon">📂</span>
-                                <span class="msg-forward-title">合并转发消息</span>
-                                <span class="msg-forward-count">(共 ${items.length} 条消息${idDisplay})</span>
-                            </div>
-                            <span class="msg-forward-toggle-btn">展开 </span>
-                        </div>
-                        <div class="msg-forward-content collapsed">
-                            ${itemsHtml}
-                        </div>
-                    </div>
-                `;
-            } else {
-                const idDisplay = forwardId ? ` (未展开, ID: ${escapeAttr(forwardId)})` : ' (未展开)';
-                renderedForward = `
-                    <div class="msg-forward-container unexpanded">
-                        <div class="msg-forward-header" style="cursor: default;">
-                            <div class="msg-forward-title-row">
-                                <span class="msg-forward-icon">📂</span>
-                                <span class="msg-forward-title">合并转发消息</span>
-                                <span class="msg-forward-count">${idDisplay}</span>
-                            </div>
-                        </div>
-                    </div>
-                `;
-            }
-
-            escaped = beforeText + renderedForward + afterText;
-        }
-    }
-
-    return escaped;
+    return markdown.restore(escaped);
 }
 
 function settleLoadedImages(container) {

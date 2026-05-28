@@ -156,9 +156,49 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-API-Key", "Content-Type"],
 )
+
+# Session token store: maps random token -> expiry timestamp.
+# Tokens are issued on login and validated in auth middleware,
+# so the raw API Key is never stored in cookies.
+_SESSION_TOKENS: dict[str, float] = {}
+_SESSION_TOKENS_LOCK = threading.Lock()
+_SESSION_TOKEN_MAX_AGE = 24 * 3600  # 24 hours
+
+
+def _create_session_token() -> str:
+    token = secrets.token_urlsafe(32)
+    expiry = time.time() + _SESSION_TOKEN_MAX_AGE
+    with _SESSION_TOKENS_LOCK:
+        # Prune expired tokens to prevent unbounded growth
+        now = time.time()
+        expired = [k for k, v in _SESSION_TOKENS.items() if v < now]
+        for k in expired:
+            del _SESSION_TOKENS[k]
+        _SESSION_TOKENS[token] = expiry
+    return token
+
+
+def _validate_session_token(token: str) -> bool:
+    if not token:
+        return False
+    with _SESSION_TOKENS_LOCK:
+        expiry = _SESSION_TOKENS.get(token)
+        if expiry is None:
+            return False
+        if time.time() > expiry:
+            del _SESSION_TOKENS[token]
+            return False
+        return True
+
+
+def _revoke_session_token(token: str) -> None:
+    if not token:
+        return
+    with _SESSION_TOKENS_LOCK:
+        _SESSION_TOKENS.pop(token, None)
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -178,10 +218,18 @@ async def auth_middleware(request: Request, call_next):
     if is_public:
         return await call_next(request)
 
-    # Support API Key via header or HttpOnly cookie. Never accept API keys in URLs.
-    req_key = request.headers.get("X-API-Key", "") or request.cookies.get("archive_auth", "")
+    # Support API Key via header (direct key) or HttpOnly cookie (session token).
+    # Never accept API keys in URLs.
+    header_key = request.headers.get("X-API-Key", "")
+    cookie_token = request.cookies.get("archive_auth", "")
 
-    if not req_key or not secrets.compare_digest(req_key, API_KEY):
+    authenticated = False
+    if header_key and secrets.compare_digest(header_key, API_KEY):
+        authenticated = True
+    elif cookie_token and _validate_session_token(cookie_token):
+        authenticated = True
+
+    if not authenticated:
         return JSONResponse(
             status_code=401,
             content={"error": "Unauthorized", "message": "Invalid API Key"},
@@ -230,7 +278,12 @@ _STATS_CACHE_TTL = _load_stats_cache_ttl()
 _HISTORY_MESSAGE_MAX_CHARS = _load_history_message_max_chars()
 
 
+_ALLOWED_PRAGMA_TABLES = frozenset({"chat_history", "session_stats"})
+
+
 def _table_has_columns(db, table: str, columns: tuple[str, ...]) -> bool:
+    if table not in _ALLOWED_PRAGMA_TABLES:
+        return False
     try:
         rows = db.execute(f"PRAGMA table_info({table});").fetchall()
         existing = {row["name"] for row in rows}
@@ -679,11 +732,12 @@ async def verify_auth(request: Request):
             content={"success": False, "message": "API Key is not configured"},
         )
     if provided_key and secrets.compare_digest(provided_key, API_KEY):
+        session_token = _create_session_token()
         resp = JSONResponse(content={"success": True})
         resp.set_cookie(
             "archive_auth",
-            provided_key,
-            max_age=7 * 24 * 3600,
+            session_token,
+            max_age=_SESSION_TOKEN_MAX_AGE,
             httponly=True,
             samesite="lax",
             secure=request.url.scheme == "https",
@@ -693,6 +747,8 @@ async def verify_auth(request: Request):
 
 @app.post("/api/auth/logout")
 async def logout_auth(request: Request):
+    cookie_token = request.cookies.get("archive_auth", "")
+    _revoke_session_token(cookie_token)
     resp = JSONResponse(content={"success": True})
     resp.delete_cookie(
         "archive_auth",
@@ -905,7 +961,7 @@ def get_history(
         )
     except Exception as e:
         logger.error(f"WebUI get_history error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         if db:
             db.close()
@@ -994,7 +1050,7 @@ def _find_cached_telegram_avatar(cache_dir: Path, cache_key: str) -> str:
     if not cache_dir or not cache_dir.exists():
         return ""
     import hashlib
-    digest = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:32]
     for suffix in (".jpg", ".png", ".jpeg", ".webp", ".gif"):
         filename = f"telegram_avatar_{digest}{suffix}"
         if (cache_dir / filename).exists():
@@ -1135,7 +1191,7 @@ def get_sessions(request: Request):
         return JSONResponse(content={"success": True, "data": sessions})
     except Exception as e:
         logger.error(f"WebUI get_sessions error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         if db:
             db.close()
@@ -1168,7 +1224,7 @@ def get_dashboard(
         return JSONResponse(content={"success": True, "data": data})
     except Exception as e:
         logger.error(f"WebUI get_dashboard error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.get("/api/stats")
 def get_stats(
@@ -1306,7 +1362,7 @@ def get_stats(
         return JSONResponse(content={"success": True, "data": payload})
     except Exception as e:
         logger.error(f"WebUI get_stats error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         if db:
             db.close()
@@ -1388,7 +1444,7 @@ def get_members(
         )
     except Exception as e:
         logger.error(f"WebUI get_members error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Internal server error")
     finally:
         if db:
             db.close()

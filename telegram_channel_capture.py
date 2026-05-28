@@ -454,7 +454,7 @@ class TelegramChannelCapture:
         if suffix == ".jpeg":
             suffix = ".jpg"
 
-        digest = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(cache_key.encode("utf-8")).hexdigest()[:32]
         cache_dir.mkdir(parents=True, exist_ok=True)
         dest_path = cache_dir / f"telegram_avatar_{digest}{suffix}"
         relative_url = f"/static/cache/{dest_path.name}"
