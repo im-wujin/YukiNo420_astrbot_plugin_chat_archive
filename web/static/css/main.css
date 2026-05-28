@@ -98,6 +98,64 @@ body {
     display: inline-block;
 }
 
+.platform-filter-bar {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    gap: 0.5rem;
+    padding: 0.75rem 1rem;
+    background: rgba(15, 23, 42, 0.4);
+    backdrop-filter: blur(12px);
+    -webkit-backdrop-filter: blur(12px);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+    align-items: center;
+}
+.platform-filter-bar::-webkit-scrollbar {
+    display: none;
+}
+.platform-tab {
+    flex-shrink: 0;
+    padding: 0.4rem 0.9rem;
+    border-radius: 100px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    cursor: pointer;
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--text-muted);
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+    box-shadow: inset 0 1px 1px rgba(255, 255, 255, 0.05);
+}
+.platform-tab:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.15);
+    color: var(--text-main);
+    transform: translateY(-1px);
+}
+.platform-tab.active {
+    background: var(--active-bg, var(--primary));
+    color: #fff !important;
+    border-color: var(--active-border, var(--primary-light));
+    box-shadow: 0 4px 15px var(--active-glow, var(--primary-glow)),
+                inset 0 1px 1px rgba(255, 255, 255, 0.2);
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.2);
+}
+.platform-tab .platform-icon {
+    font-size: 0.85rem;
+    filter: grayscale(0.3);
+    transition: filter 0.2s ease;
+}
+.platform-tab.active .platform-icon {
+    filter: grayscale(0) drop-shadow(0 0 4px rgba(255, 255, 255, 0.5));
+}
+
 .session-list {
     flex: 1;
     overflow-y: auto;
@@ -195,6 +253,7 @@ body {
 .session-info {
     flex: 1;
     min-width: 0;
+    padding-right: 24px;
 }
 
 .session-item:hover {
@@ -985,6 +1044,8 @@ body {
     box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
     display: flex;
     flex-direction: column;
+    align-items: center;
+    justify-content: center;
     transition: var(--transition);
     isolation: isolate;
 }
@@ -1001,7 +1062,7 @@ body {
     -webkit-background-clip: text;
     background-clip: text;
     -webkit-text-fill-color: transparent;
-    margin: 0.5rem 0;
+    margin: 0.5rem auto;
     line-height: 1;
     display: inline-block;
     width: fit-content;
@@ -2040,4 +2101,354 @@ body {
 
 .fill-groups {
     background: linear-gradient(90deg, #06b6d4, #22d3ee); /* Cyan */
+}
+
+/* Discord Server Group styling */
+.discord-server-group {
+    margin-bottom: 0.5rem;
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px solid rgba(255, 255, 255, 0.03);
+    overflow: hidden;
+    transition: var(--transition);
+}
+
+.discord-server-header {
+    display: flex;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: var(--text-main);
+    gap: 12px;
+    user-select: none;
+    transition: background 0.2s, color 0.2s;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.02);
+}
+
+.discord-server-header:hover {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-main);
+}
+
+.discord-server-header .server-arrow {
+    font-size: 0.65rem;
+    transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+    opacity: 0.6;
+}
+
+.discord-server-header.collapsed .server-arrow {
+    transform: rotate(-90deg);
+}
+
+.discord-server-header .server-icon {
+    font-size: 1.25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 40px;
+    height: 40px;
+    border-radius: 12px;
+    background: rgba(88, 101, 242, 0.15);
+    color: #5865F2;
+    border: 1px solid rgba(88, 101, 242, 0.2);
+    flex-shrink: 0;
+    overflow: hidden;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.2);
+}
+
+.discord-server-header .server-title {
+    flex: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.discord-server-header .channel-count-badge {
+    font-size: 0.7rem;
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+    padding: 1px 6px;
+    border-radius: 10px;
+    font-weight: normal;
+}
+
+.discord-channels-list {
+    transition: max-height 0.28s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.2s ease;
+    max-height: 1000px;
+    opacity: 1;
+}
+
+.discord-channels-list.collapsed {
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+    pointer-events: none;
+}
+
+.discord-channel-item {
+    margin-left: 0.5rem;
+    margin-right: 0.5rem;
+    padding: 0.5rem 0.8rem !important;
+    gap: 8px !important;
+}
+
+.discord-channel-item .channel-hashtag {
+    font-size: 1.1rem;
+    font-weight: bold;
+    color: var(--text-muted);
+    opacity: 0.5;
+    width: 20px;
+    text-align: center;
+    flex-shrink: 0;
+    transition: color 0.2s, opacity 0.2s;
+}
+
+.discord-channel-item.active .channel-hashtag {
+    color: #5865F2;
+    opacity: 1;
+    text-shadow: 0 0 8px rgba(88, 101, 242, 0.4);
+}
+
+/* Merged / Forwarded Message Card Styling */
+.msg-forward-container {
+    background: rgba(15, 23, 42, 0.25);
+    border: 1px solid var(--glass-border);
+    border-radius: 12px;
+    margin: 8px 0;
+    overflow: hidden;
+    max-width: 100%;
+    transition: all 0.2s ease;
+}
+
+.msg-forward-container:hover {
+    background: rgba(15, 23, 42, 0.35);
+    border-color: rgba(255, 255, 255, 0.15);
+}
+
+.msg-forward-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 10px 14px;
+    background: rgba(255, 255, 255, 0.03);
+    cursor: pointer;
+    user-select: none;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.msg-forward-title-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.msg-forward-icon {
+    font-size: 1.1rem;
+    color: var(--primary-light);
+}
+
+.msg-forward-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: var(--text-main);
+}
+
+.msg-forward-count {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.msg-forward-toggle-btn {
+    font-size: 0.75rem;
+    color: var(--primary-light);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    transition: transform 0.2s ease;
+}
+
+.msg-forward-toggle-btn::after {
+    content: '▼';
+    display: inline-block;
+    transition: transform 0.2s ease;
+    font-size: 0.65rem;
+}
+
+.msg-forward-container.expanded .msg-forward-toggle-btn::after {
+    transform: rotate(180deg);
+}
+
+.msg-forward-content {
+    padding: 12px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    border-left: 3px solid rgba(99, 102, 241, 0.3);
+    margin-left: 12px;
+    margin-top: 8px;
+    margin-bottom: 8px;
+    transition: max-height 0.25s ease-out, opacity 0.2s ease;
+}
+
+.msg-forward-content.collapsed {
+    max-height: 0;
+    padding: 0 14px;
+    margin: 0;
+    opacity: 0;
+    pointer-events: none;
+    border: none;
+}
+
+.msg-forward-item {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 0.85rem;
+    line-height: 1.4;
+    border-bottom: 1px dashed rgba(255, 255, 255, 0.05);
+    padding-bottom: 8px;
+}
+
+.msg-forward-item:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+}
+
+.msg-forward-sender {
+    font-weight: 700;
+    font-size: 0.78rem;
+    color: var(--primary-light);
+}
+
+.msg-forward-text {
+    color: var(--text-main);
+}
+
+/* Platform Logo Badges for Session Items */
+.session-platform-badge {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 24px;
+    height: 24px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: var(--badge-color, var(--text-muted));
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    z-index: 5;
+}
+
+.session-item:hover .session-platform-badge {
+    transform: scale(1.1);
+    background: var(--badge-bg-hover, rgba(255, 255, 255, 0.12));
+    border-color: var(--badge-border-hover, rgba(255, 255, 255, 0.2));
+    box-shadow: 0 4px 12px var(--badge-shadow-hover, rgba(0, 0, 0, 0.3));
+    color: var(--badge-color-hover, var(--text-main));
+}
+
+.session-platform-badge svg {
+    width: 15px;
+    height: 15px;
+    fill: currentColor;
+    display: block;
+}
+
+/* Platform Specific Badge Color Schemes */
+.badge-plat-qq {
+    --badge-color: #ffffff;
+    --badge-bg-hover: rgba(255, 255, 255, 0.15);
+    --badge-border-hover: rgba(255, 255, 255, 0.3);
+    --badge-shadow-hover: rgba(255, 255, 255, 0.2);
+    --badge-color-hover: #ffffff;
+}
+
+.badge-plat-telegram {
+    --badge-color: #0088cc;
+    --badge-bg-hover: rgba(0, 136, 204, 0.15);
+    --badge-border-hover: rgba(0, 136, 204, 0.3);
+    --badge-shadow-hover: rgba(0, 136, 204, 0.25);
+    --badge-color-hover: #0088cc;
+}
+
+.badge-plat-discord {
+    --badge-color: #5865F2;
+    --badge-bg-hover: rgba(88, 101, 242, 0.15);
+    --badge-border-hover: rgba(88, 101, 242, 0.3);
+    --badge-shadow-hover: rgba(88, 101, 242, 0.25);
+    --badge-color-hover: #5865F2;
+}
+
+.badge-plat-wechat, .badge-plat-wecom {
+    --badge-color: #07c160;
+    --badge-bg-hover: rgba(7, 193, 96, 0.15);
+    --badge-border-hover: rgba(7, 193, 96, 0.3);
+    --badge-shadow-hover: rgba(7, 193, 96, 0.25);
+    --badge-color-hover: #07c160;
+}
+
+.badge-plat-kook {
+    --badge-color: #8b5cf6;
+    --badge-bg-hover: rgba(139, 92, 246, 0.15);
+    --badge-border-hover: rgba(139, 92, 246, 0.3);
+    --badge-shadow-hover: rgba(139, 92, 246, 0.25);
+    --badge-color-hover: #8b5cf6;
+}
+
+.badge-plat-teamspeak {
+    --badge-color: #3b82f6;
+    --badge-bg-hover: rgba(59, 130, 246, 0.15);
+    --badge-border-hover: rgba(59, 130, 246, 0.3);
+    --badge-shadow-hover: rgba(59, 130, 246, 0.25);
+    --badge-color-hover: #3b82f6;
+}
+
+.badge-plat-feishu {
+    --badge-color: #00d2fc;
+    --badge-bg-hover: rgba(0, 210, 252, 0.15);
+    --badge-border-hover: rgba(0, 210, 252, 0.3);
+    --badge-shadow-hover: rgba(0, 210, 252, 0.25);
+    --badge-color-hover: #00d2fc;
+}
+
+.badge-plat-dingtalk {
+    --badge-color: #007fff;
+    --badge-bg-hover: rgba(0, 127, 255, 0.15);
+    --badge-border-hover: rgba(0, 127, 255, 0.3);
+    --badge-shadow-hover: rgba(0, 127, 255, 0.25);
+    --badge-color-hover: #007fff;
+}
+
+/* Also style dynamic platform tab SVGs */
+.platform-tab .platform-icon svg {
+    width: 16px;
+    height: 16px;
+    fill: currentColor;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+/* Inline Platform Logos for search result headers */
+.author-session-platform {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    color: var(--badge-color, var(--text-muted));
+    vertical-align: middle;
+    transition: color 0.2s ease;
+}
+
+.author-session-platform svg {
+    width: 100%;
+    height: 100%;
+    fill: currentColor;
+    display: block;
 }

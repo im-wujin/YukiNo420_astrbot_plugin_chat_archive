@@ -46,6 +46,48 @@ let filterEnd = 0;
 let activeMsgType = '';
 const sessionsById = new Map();
 
+// Modern SVG Icons for chat platforms
+const QQ_SVG = `<svg role="img" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><title>QQ</title><path d="M21.395 15.035a40 40 0 0 0-.803-2.264l-1.079-2.695c.001-.032.014-.562.014-.836C19.526 4.632 17.351 0 12 0S4.474 4.632 4.474 9.241c0 .274.013.804.014.836l-1.08 2.695a39 39 0 0 0-.802 2.264c-1.021 3.283-.69 4.643-.438 4.673.54.065 2.103-2.472 2.103-2.472 0 1.469.756 3.387 2.394 4.771-.612.188-1.363.479-1.845.835-.434.32-.379.646-.301.778.343.578 5.883.369 7.482.189 1.6.18 7.14.389 7.483-.189.078-.132.132-.458-.301-.778-.483-.356-1.233-.646-1.846-.836 1.637-1.384 2.393-3.302 2.393-4.771 0 0 1.563 2.537 2.103 2.472.251-.03.581-1.39-.438-4.673"/></svg>`;
+const TG_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-1-.65-.35-1 .22-1.6 1.5-1.55 2.76-2.93 2.76-2.95 0-.03-.01-.16-.09-.23a.3.3 0 0 0-.23-.04c-.1.02-1.74 1.1-4.93 3.25-.47.32-.9.48-1.28.47-.42-.01-1.22-.24-1.82-.43-.73-.24-1.3-.37-1.25-.79.03-.22.3-.44.82-.67 3.2-1.39 5.34-2.3 6.42-2.73 3.05-1.22 3.68-1.43 4.1-.14.09.28.1.58.07.89z"/></svg>`;
+const DISCORD_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.094 13.094 0 0 1-1.873-.894.077.077 0 0 1-.008-.128c.126-.093.252-.19.372-.287a.075.075 0 0 1 .077-.011c3.92 1.793 8.18 1.793 12.061 0a.073.073 0 0 1 .078.009c.12.099.246.195.373.289a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.156-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.156 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.156-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.156 2.418z"/></svg>`;
+const WECHAT_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8.283 2.167c-4.114 0-7.442 2.872-7.442 6.417 0 2.054 1.127 3.883 2.88 5.093l-.744 2.222 2.533-1.282c.84.254 1.745.385 2.773.385.556 0 1.103-.04 1.636-.118a5.955 5.955 0 0 1-.223-1.579c0-3.327 3.018-6.027 6.742-6.027.26 0 .524.015.782.042C16.31 4.218 12.639 2.167 8.283 2.167zm12.35 6.643c-3.435 0-6.223 2.47-6.223 5.518 0 3.047 2.788 5.518 6.223 5.518.736 0 1.442-.11 2.096-.316l1.97 1.037-.58-1.895c1.373-1.01 2.247-2.5 2.247-4.16 0-3.136-2.88-5.702-6.733-5.702z"/></svg>`;
+const KOOK_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-2 13h-2.5l-3-3.75V16H9V8h2.5v3.25L14.5 8H17l-3.5 4.5 3.5 3.5z"/></svg>`;
+const TEAMSPEAK_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M3 18v-6a9 9 0 0 1 18 0v6"/><path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/></svg>`;
+const FEISHU_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c5.52 0 10 4.48 10 10s-4.48 10-10 10S2 17.52 2 12 6.48 2 12 2zm1 5.5l-5.5 5.5H11v3.5l5.5-5.5H13V7.5z"/></svg>`;
+const DINGTALK_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M2 12C2 6.48 6.48 2 12 2s10 4.48 10 10-4.48 10-10 10S2 17.52 2 12zm13.84-2.83l-3.32-.83-.83-3.32a.5.5 0 0 0-.96 0l-.83 3.32-3.32.83a.5.5 0 0 0 0 .96l3.32.83.83 3.32a.5.5 0 0 0 .96 0l.83-3.32 3.32-.83a.5.5 0 0 0 0-.96z"/></svg>`;
+const FALLBACK_PLATFORM_SVG = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm8.9-6.26c-.37-.88-1.16-1.5-2.1-1.67L17 11V9c0-1.1-.9-2-2-2h-3V5c0-.55-.45-1-1-1s-1 .45-1 1v2H7V6c0-.55-.45-1-1-1s-1 .45-1 1v3.5c0 .3.13.58.35.78L7.8 12.3c.13.12.3.2.49.2H11v3c0 .55.45 1 1 1h2l.72 2.16c.1.3.3.54.58.67.28.13.6.14.89.04 1.76-.62 3.19-1.92 3.96-3.58.12-.26.1-.56-.05-.8z"/></svg>`;
+
+const PLATFORM_BADGE_META = {
+    'qq': { name: 'QQ', class: 'badge-plat-qq', svg: QQ_SVG, icon: '💬' },
+    'telegram': { name: 'Telegram', class: 'badge-plat-telegram', svg: TG_SVG, icon: '✈️' },
+    'discord': { name: 'Discord', class: 'badge-plat-discord', svg: DISCORD_SVG, icon: '🎮' },
+    'wechat': { name: '微信', class: 'badge-plat-wechat', svg: WECHAT_SVG, icon: '💬' },
+    'wecom': { name: '企业微信', class: 'badge-plat-wecom', svg: WECHAT_SVG, icon: '💬' },
+    'kook': { name: 'KOOK', class: 'badge-plat-kook', svg: KOOK_SVG, icon: '🦖' },
+    'teamspeak': { name: 'TeamSpeak', class: 'badge-plat-teamspeak', svg: TEAMSPEAK_SVG, icon: '🎙️' },
+    'feishu': { name: '飞书', class: 'badge-plat-feishu', svg: FEISHU_SVG, icon: '🕊️' },
+    'dingtalk': { name: '钉钉', class: 'badge-plat-dingtalk', svg: DINGTALK_SVG, icon: '🔔' }
+};
+
+function getPlatformBadgeHtml(platformName) {
+    if (!platformName) return '';
+    const plat = platformName.toLowerCase();
+    const meta = PLATFORM_BADGE_META[plat];
+    if (!meta) {
+        return `
+            <div class="session-platform-badge" title="其他平台: ${escapeAttr(platformName)}">
+                ${FALLBACK_PLATFORM_SVG}
+            </div>
+        `;
+    }
+    return `
+        <div class="session-platform-badge ${meta.class}" title="${meta.name}">
+            ${meta.svg}
+        </div>
+    `;
+}
+
+
 function isFriendSessionType(type = activeMsgType) {
     return safeText(type).toLowerCase().includes('friend');
 }
@@ -227,7 +269,10 @@ function formatSessionPreview(text) {
         .replace(/\[CQ:record,[^\]]*\]/g, '[语音]')
         .replace(/\[CQ:face,[^\]]*\]/g, '[表情]')
         .replace(/\[CQ:at,qq=all[^\]]*\]/g, '@全体成员')
-        .replace(/\[CQ:at,qq=([^\],]+)[^\]]*\]/g, '@$1')
+        .replace(/\[CQ:at,qq=([^\],]+)[^\]]*\]/g, (match, qq) => {
+            const name = window.userMap && window.userMap[qq] ? window.userMap[qq] : qq;
+            return `@${name}`;
+        })
         .replace(/\[CQ:reply,[^\]]*\]/g, '[回复]')
         .replace(/\s+/g, ' ')
         .trim();
@@ -591,7 +636,39 @@ function updateActiveSessionHeader() {
         if (searchInput) searchInput.placeholder = '全局搜索消息...';
     } else {
         const meta = sessionsById.get(activeSessionId) || {};
-        const title = meta.name || meta.session_name || activeSessionId;
+        let title = meta.name || meta.session_name || activeSessionId;
+
+        // Clean title if it contains any legacy prefix first
+        title = title.replace(/^👤\s*私聊:\s*/, '').replace(/^私聊:\s*/, '');
+        title = title.replace(/^💬\s*群聊:\s*/, '').replace(/^群聊:\s*/, '');
+        title = title.replace(/^📢\s*频道:\s*/, '').replace(/^频道:\s*/, '');
+
+        // Add the correct prefix for the header at the top
+        const mt = (meta.message_type || '').toLowerCase();
+        const sPlat = getSessionPlatform(meta);
+        const isServerPlatform = ['discord', 'kook', 'teamspeak'].includes(sPlat);
+        const isGroupLike = mt.includes('channel') || mt.includes('group');
+
+        if (isServerPlatform && isGroupLike) {
+            if (title.includes(' / #')) {
+                title = title.replace(' / #', ' > #');
+            } else if (title.includes(' / ')) {
+                title = title.replace(' / ', ' > ');
+            }
+            title = '🖥️ 服务器: ' + title;
+        } else if (mt.includes('friend')) {
+            title = '👤 私聊: ' + title;
+        } else if (mt.includes('channel')) {
+            if (title.includes(' / #')) {
+                title = title.replace(' / #', ' > #');
+            } else if (title.includes(' / ')) {
+                title = title.replace(' / ', ' > ');
+            }
+            title = '📢 频道: ' + title;
+        } else if (mt.includes('group')) {
+            title = '💬 群聊: ' + title;
+        }
+
         header.innerText = title;
         if (searchInput) searchInput.placeholder = '搜索当前会话...';
     }
@@ -880,6 +957,25 @@ function toggleCategory(header, content) {
     }
 }
 
+window.toggleForwardCard = (headerEl) => {
+    const container = headerEl.closest('.msg-forward-container');
+    const content = container.querySelector('.msg-forward-content');
+    if (!container || !content) return;
+
+    const isCollapsed = content.classList.contains('collapsed');
+    if (isCollapsed) {
+        content.classList.remove('collapsed');
+        container.classList.add('expanded');
+        const btn = container.querySelector('.msg-forward-toggle-btn');
+        if (btn) btn.textContent = '收起 ';
+    } else {
+        content.classList.add('collapsed');
+        container.classList.remove('expanded');
+        const btn = container.querySelector('.msg-forward-toggle-btn');
+        if (btn) btn.textContent = '展开 ';
+    }
+};
+
 function formatMsg(text) {
     if (!text) return "";
 
@@ -980,6 +1076,22 @@ function formatMsg(text) {
         return `<span class="msg-tag">🎙️ [语音]</span>`;
     });
 
+    // File Handling
+    escaped = escaped.replace(/\[CQ:file,([^\]]+)\]/g, (match, inner) => {
+        const nameMatch = inner.match(/name=([^,\]]+)/);
+        const urlMatch = inner.match(/url=([^,\]]+)/);
+        const fileName = nameMatch && nameMatch[1] ? decodeCqParamValue(nameMatch[1]) : '文件';
+        const safeName = escapeAttr(fileName);
+        if (urlMatch && urlMatch[1]) {
+            let url = decodeCqParamValue(urlMatch[1]);
+            url = proxyUrl(url);
+            if (isSafeUrl(url)) {
+                return `<a class="msg-tag" href="${escapeAttr(url)}" target="_blank" rel="noopener noreferrer">📄 ${safeName}</a>`;
+            }
+        }
+        return `<span class="msg-tag">📄 ${safeName}</span>`;
+    });
+
     const tags = ["动画表情", "文件", "红包"];
     tags.forEach(tag => {
         const regex = new RegExp(`\\[${tag}\\]`, 'g');
@@ -1005,6 +1117,93 @@ function formatMsg(text) {
         const safeId = escapeAttr(id);
         return `🛡️ [撤回了一条消息 (ID: <span class="recall-link" data-msg-id="${safeId}">${safeId}</span>)]`;
     });
+
+    // Merged Messages (合并转发) Parsing
+    if (escaped.includes('[合并转发')) {
+        const index = escaped.indexOf('[合并转发');
+        const beforeText = escaped.substring(0, index);
+        const forwardChunk = escaped.substring(index);
+
+        const match = forwardChunk.match(/\[合并转发(?:,id=([^\]]*))?\](?:\n|<br\s*\/?>)?([\s\S]*)/i);
+        if (match) {
+            const forwardId = match[1] || '';
+            const rest = match[2] || '';
+
+            // Normalize <br> tags to standard newlines to support browser innerHTML serialization
+            const normalizedRest = rest.replace(/<br\s*\/?>/gi, '\n');
+            const lines = normalizedRest.split('\n');
+            const items = [];
+            let currentItem = null;
+            let afterText = '';
+
+            lines.forEach(line => {
+                const lineMatch = line.match(/^\d+\.\s+([^\n:]+):\s*([\s\S]*)$/);
+                if (lineMatch) {
+                    if (currentItem) {
+                        items.push(currentItem);
+                    }
+                    currentItem = {
+                        sender: lineMatch[1].trim(),
+                        content: lineMatch[2].trim()
+                    };
+                } else {
+                    if (currentItem) {
+                        currentItem.content += '\n' + line;
+                    } else if (line.trim()) {
+                        afterText += line + '\n';
+                    }
+                }
+            });
+            if (currentItem) {
+                items.push(currentItem);
+            }
+
+            let renderedForward = '';
+            if (items.length > 0) {
+                const idDisplay = forwardId ? ` (ID: ${escapeAttr(forwardId)})` : '';
+                let itemsHtml = '';
+                items.forEach(item => {
+                    itemsHtml += `
+                        <div class="msg-forward-item">
+                            <span class="msg-forward-sender">${escapeAttr(item.sender)}</span>
+                            <span class="msg-forward-text">${item.content}</span>
+                        </div>
+                    `;
+                });
+
+                renderedForward = `
+                    <div class="msg-forward-container">
+                        <div class="msg-forward-header" onclick="toggleForwardCard(this)">
+                            <div class="msg-forward-title-row">
+                                <span class="msg-forward-icon">📂</span>
+                                <span class="msg-forward-title">合并转发消息</span>
+                                <span class="msg-forward-count">(共 ${items.length} 条消息${idDisplay})</span>
+                            </div>
+                            <span class="msg-forward-toggle-btn">展开 </span>
+                        </div>
+                        <div class="msg-forward-content collapsed">
+                            ${itemsHtml}
+                        </div>
+                    </div>
+                `;
+            } else {
+                const idDisplay = forwardId ? ` (未展开, ID: ${escapeAttr(forwardId)})` : ' (未展开)';
+                renderedForward = `
+                    <div class="msg-forward-container unexpanded">
+                        <div class="msg-forward-header" style="cursor: default;">
+                            <div class="msg-forward-title-row">
+                                <span class="msg-forward-icon">📂</span>
+                                <span class="msg-forward-title">合并转发消息</span>
+                                <span class="msg-forward-count">${idDisplay}</span>
+                            </div>
+                        </div>
+                    </div>
+                `;
+            }
+
+            escaped = beforeText + renderedForward + afterText;
+        }
+    }
 
     return escaped;
 }
@@ -1059,18 +1258,31 @@ document.addEventListener('click', (event) => {
     }
 });
 
-function getAvatarUrl(userId) {
-    if (/^\d+$/.test(userId)) {
+function isSafeAvatarUrl(url) {
+    return /^(https?:\/\/|\/static\/)/i.test(safeText(url));
+}
+
+function isQqLikePlatform(platformName = '') {
+    const platform = safeText(platformName).toLowerCase();
+    return !platform || platform.includes('qq') || platform.includes('onebot') || platform === 'aiocqhttp';
+}
+
+function getAvatarUrl(userId, avatarUrl = '', platformName = '') {
+    const directUrl = safeText(avatarUrl);
+    if (directUrl && isSafeAvatarUrl(directUrl)) {
+        return directUrl;
+    }
+    if (isQqLikePlatform(platformName) && /^\d+$/.test(userId)) {
         return `https://q1.qlogo.cn/g?b=qq&nk=${userId}&s=100`;
     }
     return `data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%2364748b'%3E%3Cpath d='M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 3c1.66 0 3 1.34 3 3s-1.34 3-3 3-3-1.34-3-3 1.34-3 3-3zm0 14.2c-2.5 0-4.71-1.28-6-3.22.03-1.99 4-3.08 6-3.08 1.99 0 5.97 1.09 6 3.08-1.29 1.94-3.5 3.22-6 3.22z'/%3E%3C/svg%3E`;
 }
 
-function preloadAvatar(userId) {
-    const key = safeText(userId);
+function preloadAvatar(userId, avatarUrl = '', platformName = '') {
+    const key = `${safeText(platformName)}:${safeText(userId)}:${safeText(avatarUrl)}`;
     if (avatarPreloadCache.has(key)) return avatarPreloadCache.get(key);
 
-    const url = getAvatarUrl(key);
+    const url = getAvatarUrl(userId, avatarUrl, platformName);
     const promise = new Promise(resolve => {
         const img = new Image();
         let settled = false;
@@ -1093,7 +1305,7 @@ function preloadAvatar(userId) {
 }
 
 async function preloadUserAvatars(users, limit = 12) {
-    const pending = users.slice(0, limit).map(u => preloadAvatar(u.user_id));
+    const pending = users.slice(0, limit).map(u => preloadAvatar(u.user_id, u.avatar_url, u.platform_name));
     await Promise.allSettled(pending);
 }
 
@@ -1168,97 +1380,377 @@ function createMessageBubble(msg) {
     return bubble;
 }
 
-async function fetchSessions() {
-    try {
-        const data = await fetchAPI('/api/sessions');
-        if (data.success) {
-            const list = document.getElementById('sessionList');
-            list.innerHTML = '';
+let rawSessions = [];
+let activePlatform = 'all';
 
-            const dashboardItem = document.createElement('div');
-            dashboardItem.className = `session-item dashboard-nav ${!activeSessionId ? 'active' : ''}`;
-            dashboardItem.innerHTML = `
-                <div class="dashboard-nav-icon">📊</div>
-                <div class="session-info">
-                    <div class="session-name">总览 Dashboard</div>
-                    <div class="session-last">整体数据、趋势与最近消息</div>
-                </div>`;
-            dashboardItem.onclick = () => showDashboard();
-            list.appendChild(dashboardItem);
+const PLATFORM_META = {
+    'all': { name: '全部', icon: '🌈', color: '#6366f1' },
+    'qq': { name: 'QQ', icon: '💬', color: '#ffffff' },
+    'telegram': { name: 'Telegram', icon: '✈️', color: '#0088cc' },
+    'discord': { name: 'Discord', icon: '🎮', color: '#5865F2' }
+};
 
-            sessionsById.clear();
-            const groups = {
-                'group': { name: '群组会话', items: [] },
-                'friend': { name: '个人私聊', items: [] },
-                'legacy': { name: '历史归档', items: [] }
+const NON_QQ_PLATFORMS = ['telegram', 'discord', 'kook', 'feishu', 'dingtalk', 'wechat', 'wecom'];
+
+function normalizePlatformName(platformName) {
+    if (!platformName) return '';
+    const plat = platformName.toLowerCase();
+    if (NON_QQ_PLATFORMS.includes(plat)) {
+        return plat;
+    }
+    return 'qq';
+}
+
+function getSessionPlatform(s) {
+    if (s.platform_name) {
+        return normalizePlatformName(s.platform_name);
+    }
+    // Fallback: extract platform from session_id (e.g. aiocqhtp:GroupMessage:160572189)
+    if (s.session_id && s.session_id.includes(':')) {
+        const firstPart = s.session_id.split(':')[0];
+        return normalizePlatformName(firstPart);
+    }
+    return '';
+}
+
+function renderPlatformFilter(sessions) {
+    const bar = document.getElementById('platformFilterBar');
+    if (!bar) return;
+
+    // Dynamically discover all platforms present in sessions
+    const platforms = new Set();
+    sessions.forEach(s => {
+        const plat = getSessionPlatform(s);
+        if (plat) {
+            platforms.add(plat);
+        }
+    });
+
+    const orderedPlats = ['all'];
+    const knownPlats = ['qq', 'telegram', 'discord'];
+    knownPlats.forEach(p => {
+        if (platforms.has(p)) {
+            orderedPlats.push(p);
+            platforms.delete(p);
+        }
+    });
+    // Add any remaining dynamically discovered platforms for 100% future extensibility!
+    platforms.forEach(p => {
+        if (p) orderedPlats.push(p);
+    });
+
+    bar.innerHTML = orderedPlats.map(plat => {
+        const badgeMeta = PLATFORM_BADGE_META[plat];
+        const meta = PLATFORM_META[plat] || {
+            name: plat.charAt(0).toUpperCase() + plat.slice(1),
+            icon: '🌐',
+            color: '#8b5cf6'
+        };
+        const isActive = activePlatform === plat;
+        const color = meta.color;
+        const style = isActive ?
+            `style="--active-bg: ${color}cc; --active-border: ${color}; --active-glow: ${color}33;"` : '';
+
+        // Use dynamic SVG if defined, otherwise fallback to standard icon emoji/text
+        const iconHtml = (badgeMeta && badgeMeta.svg) ? badgeMeta.svg : meta.icon;
+
+        return `
+            <div class="platform-tab ${isActive ? 'active' : ''}" data-platform="${plat}" ${style}>
+                <span class="platform-icon">${iconHtml}</span>
+                <span class="platform-name">${meta.name || (badgeMeta && badgeMeta.name)}</span>
+            </div>
+        `;
+    }).join('');
+
+    // Attach click handlers
+    bar.querySelectorAll('.platform-tab').forEach(tab => {
+        tab.onclick = () => {
+            activePlatform = tab.dataset.platform;
+            renderPlatformFilter(sessions);
+            renderSessionList(sessions);
+        };
+    });
+
+    // Horizontal mouse wheel scrolling for PC
+    if (!bar.dataset.wheelAttached) {
+        bar.addEventListener('wheel', (e) => {
+            if (e.deltaY !== 0) {
+                e.preventDefault();
+                bar.scrollLeft += e.deltaY;
+            }
+        }, { passive: false });
+        bar.dataset.wheelAttached = 'true';
+    }
+}
+
+function renderSessionList(sessions) {
+    const list = document.getElementById('sessionList');
+    if (!list) return;
+    list.innerHTML = '';
+
+    const dashboardItem = document.createElement('div');
+    dashboardItem.className = `session-item dashboard-nav ${!activeSessionId ? 'active' : ''}`;
+    dashboardItem.innerHTML = `
+        <div class="dashboard-nav-icon">📊</div>
+        <div class="session-info">
+            <div class="session-name">总览 Dashboard</div>
+            <div class="session-last">整体数据、趋势与最近消息</div>
+        </div>`;
+    dashboardItem.onclick = () => showDashboard();
+    list.appendChild(dashboardItem);
+
+    sessionsById.clear();
+    const groups = {
+        'group': { name: '群组会话', items: [] },
+        'server': { name: '服务器', items: [] },
+        'channel': { name: '频道消息', items: [] },
+        'friend': { name: '个人私聊', items: [] },
+        'legacy': { name: '历史归档', items: [] }
+    };
+
+    sessions.forEach(s => {
+        if (s.name) {
+            // Strip any legacy '👤 私聊: ' or '私聊: ' prefixes from the session name in UI
+            s.name = s.name.replace(/^👤\s*私聊:\s*/, '').replace(/^私聊:\s*/, '');
+        }
+        // Cache all sessions regardless of filter so selectSession works
+        sessionsById.set(s.session_id, { ...s });
+
+        // Filter by platform
+        if (activePlatform !== 'all' && s.session_id !== 'legacy:archive') {
+            const sPlat = getSessionPlatform(s);
+            if (sPlat !== activePlatform) return;
+        }
+
+        let category = 'legacy';
+        const mt = (s.message_type || '').toLowerCase();
+        const sPlat = getSessionPlatform(s);
+        const isServerPlatform = ['discord', 'kook', 'teamspeak'].includes(sPlat);
+        const isGroupLike = mt.includes('channel') || mt.includes('group');
+
+        if (isServerPlatform && isGroupLike) {
+            category = 'server';
+        } else if (mt.includes('channel')) {
+            category = 'channel';
+        } else if (mt.includes('group')) {
+            category = 'group';
+        } else if (mt.includes('friend')) {
+            category = 'friend';
+        }
+
+        if (s.name === s.session_id && s.session_id.includes(':')) {
+            const parts = s.session_id.split(':');
+            const id = parts[parts.length - 1];
+            if (category === 'channel') {
+                s.name = '频道: ' + id;
+            } else if (category === 'group') {
+                s.name = '群聊: ' + id;
+            } else if (category === 'server') {
+                const platName = sPlat.toUpperCase();
+                s.name = platName + ' 服务器 / #' + id;
+            } else {
+                s.name = id;
+            }
+        }
+
+        if (groups[category]) groups[category].items.push(s);
+    });
+
+    Object.keys(groups).forEach(catKey => {
+        const groupData = groups[catKey];
+        if (groupData.items.length === 0) return;
+
+        let displayCount = groupData.items.length;
+        let serverGroups = null;
+
+        if (catKey === 'server') {
+            // Helper to parse Discord/Kook/Teamspeak server and channel names
+            const parseServerName = (name, platform) => {
+                const defaultServerName = (platform === 'kook' ? 'KOOK 服务器' : (platform === 'teamspeak' ? 'TeamSpeak 服务器' : 'Discord 服务器'));
+                if (!name) return { server: defaultServerName, channel: '未知频道' };
+                if (name.includes(' / #')) {
+                    const parts = name.split(' / #');
+                    return { server: parts[0].trim(), channel: parts[1].trim() };
+                }
+                if (name.includes(' / ')) {
+                    const parts = name.split(' / ');
+                    return { server: parts[0].trim(), channel: parts[1].trim() };
+                }
+                return { server: defaultServerName, channel: name };
             };
 
-            data.data.forEach(s => {
-                let category = 'legacy';
-                const mt = (s.message_type || '').toLowerCase();
-                if (mt.includes('group')) category = 'group';
-                else if (mt.includes('friend')) category = 'friend';
-
-                if (s.name === s.session_id && s.session_id.includes(':')) {
-                    const parts = s.session_id.split(':');
-                    const id = parts[parts.length - 1];
-                    s.name = (category === 'group' ? '群聊: ' : '私聊: ') + id;
+            serverGroups = {};
+            groupData.items.forEach(s => {
+                const sPlat = getSessionPlatform(s);
+                const parsed = parseServerName(s.name, sPlat);
+                if (!serverGroups[parsed.server]) {
+                    serverGroups[parsed.server] = {
+                        platform: sPlat,
+                        channels: []
+                    };
                 }
-
-                sessionsById.set(s.session_id, { ...s });
-                if (groups[category]) groups[category].items.push(s);
+                serverGroups[parsed.server].channels.push({
+                    session: s,
+                    channelName: parsed.channel
+                });
             });
 
-            Object.keys(groups).forEach(catKey => {
-                const groupData = groups[catKey];
-                if (groupData.items.length === 0) return;
+            displayCount = Object.keys(serverGroups).length;
+        }
 
-                const header = document.createElement('div');
-                header.className = 'category-header';
-                const label = document.createElement('span');
-                label.textContent = `${groupData.name} `;
-                const count = document.createElement('small');
-                count.style.opacity = '0.5';
-                count.style.fontWeight = 'normal';
-                count.textContent = groupData.items.length;
-                label.appendChild(count);
-                const toggle = document.createElement('span');
-                toggle.className = 'toggle-icon';
-                toggle.textContent = '▼';
-                header.append(label, toggle);
+        const header = document.createElement('div');
+        header.className = 'category-header';
+        const label = document.createElement('span');
+        label.textContent = `${groupData.name} `;
+        const count = document.createElement('small');
+        count.style.opacity = '0.5';
+        count.style.fontWeight = 'normal';
+        count.textContent = displayCount;
+        label.appendChild(count);
+        const toggle = document.createElement('span');
+        toggle.className = 'toggle-icon';
+        toggle.textContent = '▼';
+        header.append(label, toggle);
 
-                const content = document.createElement('div');
-                content.className = 'category-content';
-                header.onclick = () => toggleCategory(header, content);
+        const content = document.createElement('div');
+        content.className = 'category-content';
+        header.onclick = () => toggleCategory(header, content);
 
-                groupData.items.forEach((s, idx) => {
+        if (catKey === 'server') {
+            // Render Server Groups
+            Object.keys(serverGroups).forEach((serverName, sIdx) => {
+                const serverData = serverGroups[serverName];
+                const channels = serverData.channels;
+                const platform = serverData.platform;
+
+                const serverGroup = document.createElement('div');
+                serverGroup.className = 'discord-server-group';
+
+                const hasActiveChannel = channels.some(c => activeSessionId === c.session.session_id);
+                let isCollapsed = localStorage.getItem(`server_collapsed_${serverName}`) === 'true';
+                if (hasActiveChannel) {
+                    isCollapsed = false;
+                }
+
+                // Get platform specific icon
+                let platformIcon = '🎮';
+                if (platform === 'kook') platformIcon = '🦖';
+                else if (platform === 'teamspeak') platformIcon = '🎙️';
+
+                // Get the server icon URL from the first channel in the server group
+                const serverIconUrl = channels[0] && channels[0].session.avatar;
+                let serverIconHtml = '';
+                if (serverIconUrl && serverIconUrl.trim() !== '') {
+                    serverIconHtml = `<img src="${escapeAttr(serverIconUrl)}" class="server-avatar-img" onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';" style="width:100%; height:100%; object-fit:cover;" /><span class="server-icon-fallback" style="display:none; width:100%; height:100%; align-items:center; justify-content:center;">${platformIcon}</span>`;
+                } else {
+                    serverIconHtml = `<span class="server-icon-fallback" style="width:100%; height:100%; display:flex; align-items:center; justify-content:center;">${platformIcon}</span>`;
+                }
+
+                const serverHeader = document.createElement('div');
+                serverHeader.className = `discord-server-header ${isCollapsed ? 'collapsed' : ''}`;
+                serverHeader.innerHTML = `
+                    <span class="server-arrow">▼</span>
+                    <span class="server-icon" style="padding: 0;">${serverIconHtml}</span>
+                    <span class="server-title"></span>
+                    <span class="channel-count-badge">${channels.length}</span>
+                `;
+                serverHeader.querySelector('.server-title').textContent = serverName;
+
+                const channelsList = document.createElement('div');
+                channelsList.className = `discord-channels-list ${isCollapsed ? 'collapsed' : ''}`;
+
+                serverHeader.onclick = (e) => {
+                    e.stopPropagation();
+                    const nowCollapsed = !channelsList.classList.contains('collapsed');
+                    if (nowCollapsed) {
+                        channelsList.classList.add('collapsed');
+                        serverHeader.classList.add('collapsed');
+                        localStorage.setItem(`server_collapsed_${serverName}`, 'true');
+                    } else {
+                        channelsList.classList.remove('collapsed');
+                        serverHeader.classList.remove('collapsed');
+                        localStorage.setItem(`server_collapsed_${serverName}`, 'false');
+                    }
+                };
+
+                channels.forEach((c, cIdx) => {
+                    const s = c.session;
                     const item = document.createElement('div');
-                    item.className = `session-item session-enter ${activeSessionId === s.session_id ? 'active' : ''}`;
+                    const isActive = activeSessionId === s.session_id;
+                    item.className = `session-item discord-channel-item session-enter ${isActive ? 'active' : ''}`;
                     item.dataset.sessionId = s.session_id;
-                    item.style.animationDelay = `${Math.min(idx, 8) * 0.025}s`;
+                    item.style.animationDelay = `${Math.min(cIdx, 8) * 0.025}s`;
                     item.onclick = (e) => {
                         e.stopPropagation();
                         selectSession(s.session_id, s.name, s.message_type);
                     };
 
-                    const avatarUrl = escapeAttr(s.avatar || getAvatarUrl('fallback'));
                     const lastTime = safeCount(s.last_time);
                     const lastDate = lastTime ? new Date(lastTime * 1000).toLocaleDateString() : '';
+                    const sPlat = getSessionPlatform(s);
+                    const badgeHtml = getPlatformBadgeHtml(sPlat);
+
                     item.innerHTML = `
-                        <img class="session-avatar" src="${avatarUrl}" onerror="this.src=getAvatarUrl('fallback')" />
+                        <div class="channel-hashtag">#</div>
                         <div class="session-info">
                             <div class="session-meta"><span>${escapeAttr(lastDate)}</span></div>
                             <div class="session-name"></div>
                             <div class="session-last"></div>
-                        </div>`;
-                    item.querySelector('.session-name').textContent = safeText(s.name);
+                        </div>
+                        ${badgeHtml}`;
+                    item.querySelector('.session-name').textContent = c.channelName;
                     item.querySelector('.session-last').textContent = formatSessionPreview(s.last_msg);
-                    content.appendChild(item);
+                    channelsList.appendChild(item);
                 });
 
-                list.appendChild(header);
-                list.appendChild(content);
+                serverGroup.appendChild(serverHeader);
+                serverGroup.appendChild(channelsList);
+                content.appendChild(serverGroup);
             });
+        } else {
+            // Render other flat items (QQ, Telegram, etc.)
+            groupData.items.forEach((s, idx) => {
+                const item = document.createElement('div');
+                item.className = `session-item session-enter ${activeSessionId === s.session_id ? 'active' : ''}`;
+                item.dataset.sessionId = s.session_id;
+                item.style.animationDelay = `${Math.min(idx, 8) * 0.025}s`;
+                item.onclick = (e) => {
+                    e.stopPropagation();
+                    selectSession(s.session_id, s.name, s.message_type);
+                };
+
+                const avatarUrl = escapeAttr(s.avatar || getAvatarUrl('fallback'));
+                const lastTime = safeCount(s.last_time);
+                const lastDate = lastTime ? new Date(lastTime * 1000).toLocaleDateString() : '';
+                const sPlat = getSessionPlatform(s);
+                const badgeHtml = getPlatformBadgeHtml(sPlat);
+
+                item.innerHTML = `
+                    <img class="session-avatar" src="${avatarUrl}" onerror="this.src=getAvatarUrl('fallback')" />
+                    <div class="session-info">
+                        <div class="session-meta"><span>${escapeAttr(lastDate)}</span></div>
+                        <div class="session-name"></div>
+                        <div class="session-last"></div>
+                    </div>
+                    ${badgeHtml}`;
+                item.querySelector('.session-name').textContent = safeText(s.name);
+                item.querySelector('.session-last').textContent = formatSessionPreview(s.last_msg);
+                content.appendChild(item);
+            });
+        }
+
+        list.appendChild(header);
+        list.appendChild(content);
+    });
+}
+
+async function fetchSessions() {
+    try {
+        const data = await fetchAPI('/api/sessions');
+        if (data.success) {
+            rawSessions = data.data;
+            renderPlatformFilter(rawSessions);
+            renderSessionList(rawSessions);
 
             const desiredSessionId = getDesiredSessionId();
             if (desiredSessionId) {
@@ -1357,8 +1849,8 @@ function renderUserList(users = sidebarMemberUsers) {
         const wrap = document.createElement('span');
         wrap.style.cssText = 'display:flex; align-items:center; gap:0.4rem; overflow:hidden;';
         const avatar = document.createElement('img');
-        const avatarKey = safeText(u.user_id);
-        avatar.src = avatarResolvedCache.get(avatarKey) || getAvatarUrl(avatarKey);
+        const avatarKey = `${safeText(u.platform_name)}:${safeText(u.user_id)}:${safeText(u.avatar_url)}`;
+        avatar.src = avatarResolvedCache.get(avatarKey) || getAvatarUrl(u.user_id, u.avatar_url, u.platform_name);
         avatar.onerror = () => { avatar.src = getAvatarUrl('fallback'); };
         avatar.loading = 'lazy';
         avatar.decoding = 'async';
@@ -1556,7 +2048,7 @@ function renderMemberRankItems(users) {
         return `
             <div class="rank-item" data-rank="${rank}" data-user-id="${escapeAttr(u.user_id)}" data-user-name="${escapeAttr(u.sender_name)}">
                 <div class="rank-number">${rankDisp}</div>
-                <img src="${getAvatarUrl(u.user_id)}" class="rank-avatar" loading="lazy" decoding="async" onerror="this.src=getAvatarUrl('fallback')" />
+                <img src="${getAvatarUrl(u.user_id, u.avatar_url, u.platform_name)}" class="rank-avatar" loading="lazy" decoding="async" onerror="this.src=getAvatarUrl('fallback')" />
                 <div class="rank-info">
                     <div class="rank-name">${safeName}</div>
                     <div class="rank-count">${safeCount(u.count).toLocaleString()} 条消息</div>
@@ -1864,6 +2356,13 @@ async function fetchHistory(append = false) {
 
         if (data.success) {
             if (data.next_cursor !== undefined) nextCursor = data.next_cursor;
+            if (data.user_profiles) {
+                for (const [uid, profile] of Object.entries(data.user_profiles)) {
+                    if (profile && profile.sender_name) {
+                        window.userMap[uid] = profile.sender_name;
+                    }
+                }
+            }
             if (!append) {
                 list.querySelectorAll('.message-group, .skeleton-group, .date-divider, .empty-state').forEach(el => el.remove());
             }
@@ -1926,7 +2425,7 @@ async function fetchHistory(append = false) {
                     group.className = `message-group animate-fade${msg.is_right ? ' msg-right' : ''}`;
                     group.innerHTML = `
                         <div class="avatar-col">
-                            <img class="msg-author-avatar" src="${getAvatarUrl(msg.user_id)}" onerror="this.src=getAvatarUrl('fallback')" />
+                            <img class="msg-author-avatar" src="${getAvatarUrl(msg.user_id, msg.avatar_url, msg.platform_name)}" onerror="this.src=getAvatarUrl('fallback')" />
                         </div>
                         <div class="content-col">
                             <div class="msg-author">
@@ -1943,9 +2442,30 @@ async function fetchHistory(append = false) {
                         const displaySessionName = msg.session_name || msg.session_id || '未知会话';
                         const sessionEl = document.createElement('span');
                         sessionEl.className = 'author-session';
-                        sessionEl.textContent = ` @ ${displaySessionName}`;
                         sessionEl.title = '点击进入会话';
-                        sessionEl.style.cssText = 'color: var(--text-sub); font-size: 0.75rem; margin-left: 6px; cursor: pointer; text-decoration: underline; opacity: 0.8; transition: opacity 0.2s;';
+                        sessionEl.style.cssText = 'color: var(--text-sub); font-size: 0.75rem; margin-left: 6px; cursor: pointer; text-decoration: underline; opacity: 0.8; transition: opacity 0.2s; display: inline-flex; align-items: center; gap: 4px;';
+
+                        const sPlat = normalizePlatformName(msg.platform_name);
+                        const badgeMeta = PLATFORM_BADGE_META[sPlat];
+                        let logoHtml = '';
+                        let colorClass = '';
+                        if (badgeMeta) {
+                            logoHtml = badgeMeta.svg;
+                            colorClass = badgeMeta.class;
+                        } else {
+                            logoHtml = FALLBACK_PLATFORM_SVG;
+                        }
+
+                        const logoSpan = document.createElement('span');
+                        logoSpan.className = `author-session-platform ${colorClass}`;
+                        logoSpan.innerHTML = logoHtml;
+
+                        const textSpan = document.createElement('span');
+                        textSpan.textContent = `@ ${displaySessionName}`;
+
+                        sessionEl.appendChild(logoSpan);
+                        sessionEl.appendChild(textSpan);
+
                         sessionEl.onmouseover = () => { sessionEl.style.opacity = '1'; };
                         sessionEl.onmouseout = () => { sessionEl.style.opacity = '0.8'; };
                         sessionEl.onclick = (e) => {

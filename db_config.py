@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import sqlite3
-import os
-import json
 import queue
 import threading
 import datetime
@@ -11,31 +9,23 @@ from pathlib import Path
 from contextlib import contextmanager
 from astrbot.api import logger
 
-# Resolve default relative path under plugin directory
-PLUGIN_DIR = Path(__file__).resolve().parent
-
-def _expand_path(path_value: str, base_dir: Path | None = None) -> Path:
-    """Expand ~, environment variables and relative paths in a cross-platform way."""
-    expanded = os.path.expandvars(str(path_value)).strip()
-    path = Path(expanded).expanduser()
-    if not path.is_absolute():
-        path = (base_dir or DATA_DIR) / path
-    return path.resolve()
-
-
-def _get_data_dir() -> Path:
-    env_data_dir = os.environ.get("ARCHIVE_DATA_DIR", "").strip()
-    if env_data_dir:
-        return _expand_path(env_data_dir, PLUGIN_DIR)
-    try:
-        from astrbot.api.star import StarTools
-        return Path(StarTools.get_data_dir()).expanduser().resolve()
-    except Exception:
-        # Fallback for standalone decoupling execution or tests
-        return (PLUGIN_DIR / "data").resolve()
+try:
+    from .config import (
+        get_data_dir,
+        load_db_path,
+        load_sqlite_journal_mode,
+        load_sqlite_pool_size,
+    )
+except ImportError:
+    from config import (
+        get_data_dir,
+        load_db_path,
+        load_sqlite_journal_mode,
+        load_sqlite_pool_size,
+    )
 
 
-DATA_DIR = _get_data_dir()
+DATA_DIR = get_data_dir()
 
 DEFAULT_DB_PATH = str(DATA_DIR / "chat_history.db")
 
@@ -75,7 +65,7 @@ class SQLiteConnectionPool:
         # Allow cross-thread connection usage under safe queue-based reuse
         conn = sqlite3.connect(self.db_path, timeout=20, check_same_thread=False)
         conn.row_factory = self._dict_factory
-        journal_mode = _load_sqlite_journal_mode()
+        journal_mode = load_sqlite_journal_mode()
         conn.execute(f"PRAGMA journal_mode={journal_mode};")
         conn.execute("PRAGMA synchronous=NORMAL;")
         return conn
@@ -132,74 +122,7 @@ class SQLiteConnectionPool:
             with self._lock:
                 self._allocated = max(0, self._allocated - closed)
 
-
-def _get_config_path() -> Path:
-    env_config_path = os.environ.get("ARCHIVE_CONFIG_PATH", "").strip()
-    if env_config_path:
-        return _expand_path(env_config_path, PLUGIN_DIR)
-
-    config_path = DATA_DIR.parent.parent / "config" / "astrbot_plugin_chat_archive_config.json"
-    if not config_path.exists():
-        config_path = PLUGIN_DIR.parent.parent / "config" / "astrbot_plugin_chat_archive_config.json"
-    return config_path
-
-
-def _load_db_path() -> str:
-    env_db_path = os.environ.get("ARCHIVE_DB_PATH", "").strip()
-    if env_db_path:
-        return str(_expand_path(env_db_path, DATA_DIR))
-
-    config_path = _get_config_path()
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8-sig") as f:
-                data = json.load(f)
-                custom_path = data.get("basic", {}).get("db_path", "")
-                if custom_path:
-                    return str(_expand_path(custom_path, DATA_DIR))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning(f"Failed to read custom db path from config: {e}")
-    return str(_expand_path(DEFAULT_DB_PATH, DATA_DIR))
-
-
-def _load_sqlite_journal_mode() -> str:
-    allowed_modes = {"WAL", "DELETE", "TRUNCATE", "PERSIST", "MEMORY", "OFF"}
-    mode = os.environ.get("ARCHIVE_SQLITE_JOURNAL_MODE", "").strip().upper()
-    if not mode:
-        config_path = _get_config_path()
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8-sig") as f:
-                    data = json.load(f)
-                    mode = str(data.get("basic", {}).get("sqlite_journal_mode", "WAL")).strip().upper()
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Failed to read sqlite journal mode from config: {e}")
-                mode = "WAL"
-    mode = mode or "WAL"
-    if mode not in allowed_modes:
-        logger.warning(f"Unsupported SQLite journal mode '{mode}', fallback to WAL.")
-        mode = "WAL"
-    return mode
-
-
-def _load_sqlite_pool_size() -> int:
-    value = os.environ.get("ARCHIVE_SQLITE_MAX_CONNECTIONS", "").strip()
-    if not value:
-        config_path = _get_config_path()
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8-sig") as f:
-                    data = json.load(f)
-                    value = str(data.get("basic", {}).get("sqlite_max_connections", "")).strip()
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Failed to read sqlite pool size from config: {e}")
-    try:
-        pool_size = int(value or 10)
-    except (TypeError, ValueError):
-        pool_size = 10
-    return max(2, min(pool_size, 64))
-
-DB_PATH = _load_db_path()
+DB_PATH = load_db_path()
 
 _POOL = None
 _POOL_LOCK = threading.Lock()
@@ -209,7 +132,7 @@ def get_connection_pool():
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
-                _POOL = SQLiteConnectionPool(DB_PATH, max_connections=_load_sqlite_pool_size())
+                _POOL = SQLiteConnectionPool(DB_PATH, max_connections=load_sqlite_pool_size())
     return _POOL
 
 
@@ -336,9 +259,22 @@ class DatabaseManager:
                 offset, 0, 0, DatabaseManager._MAX_QUERY_OFFSET
             )
             with get_db_connection() as conn:
+                optional_columns = []
+                if column_exists(conn, "chat_history", "platform_id"):
+                    optional_columns.append("platform_id")
+                if column_exists(conn, "chat_history", "platform_name"):
+                    optional_columns.append("platform_name")
+                if column_exists(conn, "chat_history", "avatar_url"):
+                    optional_columns.append("avatar_url")
+                if column_exists(conn, "chat_history", "guild_avatar_url"):
+                    optional_columns.append("guild_avatar_url")
+                optional_select = (
+                    ", " + ", ".join(optional_columns) if optional_columns else ""
+                )
                 query = (
                     "SELECT id, user_id, sender_name, message, timestamp, "
-                    "session_id, message_type, session_name, msg_id, is_recalled "
+                    "session_id, message_type, session_name, msg_id, is_recalled"
+                    f"{optional_select} "
                     "FROM chat_history WHERE 1=1"
                 )
                 params: list = []
@@ -702,6 +638,23 @@ def migrate_v5(db):
                 END
         ''')
 
+def migrate_v6(db):
+    """Add platform provenance fields for cross-platform archive writes."""
+    if not column_exists(db, "chat_history", "platform_id"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN platform_id TEXT;")
+    if not column_exists(db, "chat_history", "platform_name"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN platform_name TEXT;")
+
+def migrate_v7(db):
+    """Add optional sender avatar URL for platforms that expose profile photos."""
+    if not column_exists(db, "chat_history", "avatar_url"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN avatar_url TEXT;")
+
+def migrate_v8(db):
+    """Add optional guild/server avatar URL for platforms that support server structures."""
+    if not column_exists(db, "chat_history", "guild_avatar_url"):
+        db.execute("ALTER TABLE chat_history ADD COLUMN guild_avatar_url TEXT;")
+
 def ensure_media_flags(db):
     """Create indexes/triggers for dashboard media flags if schema supports them."""
     if not all(column_exists(db, "chat_history", col) for col in ("has_image", "has_video", "msg_kind")):
@@ -773,6 +726,8 @@ def ensure_session_stats(db):
                 ELSE session_stats.message_type
             END,
             session_name = CASE
+                WHEN excluded.last_message_id >= session_stats.last_message_id AND excluded.session_name IS NOT NULL AND excluded.session_name != '' THEN excluded.session_name
+                WHEN excluded.last_message_id >= session_stats.last_message_id AND excluded.message_type IN ('friend', 'FriendMessage') AND (excluded.session_name IS NULL OR excluded.session_name = '') THEN session_stats.session_name
                 WHEN excluded.last_message_id >= session_stats.last_message_id THEN excluded.session_name
                 ELSE session_stats.session_name
             END,
@@ -851,10 +806,14 @@ def init_db():
                 is_recalled INTEGER DEFAULT 0,
                 has_image INTEGER DEFAULT 0,
                 has_video INTEGER DEFAULT 0,
-                msg_kind TEXT DEFAULT 'text'
+                msg_kind TEXT DEFAULT 'text',
+                platform_id TEXT,
+                platform_name TEXT,
+                avatar_url TEXT,
+                guild_avatar_url TEXT
             )''')
             # 将 user_version 置为当前最高迁移版本
-            db.execute("PRAGMA user_version = 5;")
+            db.execute("PRAGMA user_version = 8;")
             db.commit()
         else:
             # 2. 存量数据库：基于 PRAGMA user_version 进行有序增量迁移
@@ -868,6 +827,9 @@ def init_db():
                 (3, migrate_v3),
                 (4, migrate_v4),
                 (5, migrate_v5),
+                (6, migrate_v6),
+                (7, migrate_v7),
+                (8, migrate_v8),
             ]
 
             for version, migrate_func in migrations:
@@ -880,6 +842,12 @@ def init_db():
             # without doing an expensive media LIKE backfill on every startup.
             if not all(column_exists(db, "chat_history", col) for col in ("has_image", "has_video", "msg_kind")):
                 migrate_v5(db)
+            if not all(column_exists(db, "chat_history", col) for col in ("platform_id", "platform_name")):
+                migrate_v6(db)
+            if not column_exists(db, "chat_history", "avatar_url"):
+                migrate_v7(db)
+            if not column_exists(db, "chat_history", "guild_avatar_url"):
+                migrate_v8(db)
 
         # 3. 始终确保必要的高性能索引已创建（幂等）
         # 注: idx_user 和 idx_session 尽管被组合索引覆盖，保留它们是为了兼容旧查询可能只过滤单列时的性能
@@ -890,8 +858,38 @@ def init_db():
         db.execute("CREATE INDEX IF NOT EXISTS idx_user_timestamp ON chat_history(user_id, timestamp);")
         db.execute("CREATE INDEX IF NOT EXISTS idx_timestamp ON chat_history(timestamp);")
         db.execute("CREATE INDEX IF NOT EXISTS idx_session_id_desc ON chat_history(session_id, id DESC);")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_platform_id ON chat_history(platform_id);")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_platform_session ON chat_history(platform_id, session_id);")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_avatar_user ON chat_history(user_id, avatar_url);")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_guild_avatar ON chat_history(guild_avatar_url);")
         ensure_media_flags(db)
         ensure_session_stats(db)
+
+        # Migrate old Telegram channel messages to ChannelMessage type (idempotent)
+        try:
+            db.execute("""
+                UPDATE chat_history
+                SET message_type = 'ChannelMessage',
+                    session_id = REPLACE(session_id, ':GroupMessage:', ':ChannelMessage:')
+                WHERE platform_name = 'telegram'
+                  AND user_id LIKE '-%'
+                  AND message_type = 'GroupMessage';
+            """)
+            db.execute("""
+                UPDATE session_stats
+                SET message_type = 'ChannelMessage',
+                    session_id = REPLACE(session_id, ':GroupMessage:', ':ChannelMessage:')
+                WHERE session_id LIKE '%:GroupMessage:%'
+                  AND EXISTS (
+                      SELECT 1 FROM chat_history
+                      WHERE chat_history.session_id = REPLACE(session_stats.session_id, ':GroupMessage:', ':ChannelMessage:')
+                        AND chat_history.message_type = 'ChannelMessage'
+                  );
+            """)
+            db.commit()
+        except Exception as e:
+            logger.error(f"Chat Archive: Failed to migrate old Telegram channel messages: {e}")
+
         db.commit()
     finally:
         db.close()

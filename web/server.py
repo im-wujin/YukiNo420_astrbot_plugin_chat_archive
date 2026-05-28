@@ -35,114 +35,32 @@ except ImportError:
 
 from astrbot.api import logger
 
-def get_data_dir() -> Path:
-    env_data_dir = os.environ.get("ARCHIVE_DATA_DIR", "").strip()
-    if env_data_dir:
-        path = Path(os.path.expandvars(env_data_dir)).expanduser()
-        return (path if path.is_absolute() else Path(__file__).resolve().parent.parent / path).resolve()
+try:
+    from ..config import (
+        get_config_path,
+        get_data_dir,
+        load_allowed_media_domains,
+        load_api_key,
+        load_media_max_bytes,
+        load_allow_fake_ip,
+    )
+except ImportError:
     try:
-        from astrbot.api.star import StarTools
-        return Path(StarTools.get_data_dir()).expanduser().resolve()
+        import sys
+
+        sys.path.append(str(Path(__file__).resolve().parent.parent))
+        from config import (
+            get_config_path,
+            get_data_dir,
+            load_allowed_media_domains,
+            load_api_key,
+            load_media_max_bytes,
+            load_allow_fake_ip,
+        )
     except Exception:
-        # Fallback for standalone decoupling execution
-        return (Path(__file__).resolve().parent.parent / "data").resolve()
+        raise RuntimeError("无法加载 config 模块。")
 
-
-def _expand_path(path_value: str, base_dir: Path | None = None) -> Path:
-    path = Path(os.path.expandvars(str(path_value)).strip()).expanduser()
-    if not path.is_absolute():
-        path = (base_dir or Path.cwd()) / path
-    return path.resolve()
-
-
-def _get_config_path() -> Path:
-    env_config_path = os.environ.get("ARCHIVE_CONFIG_PATH", "").strip()
-    if env_config_path:
-        return _expand_path(env_config_path, Path(__file__).resolve().parent.parent)
-
-    data_dir = get_data_dir()
-    config_dir = data_dir.parent.parent / "config"
-    if not config_dir.exists():
-        config_dir = Path(__file__).resolve().parent.parent.parent.parent / "config"
-    return config_dir / "astrbot_plugin_chat_archive_config.json"
-
-def _load_api_key() -> str:
-    env_key = os.environ.get("ARCHIVE_API_KEY", "").strip()
-    if env_key:
-        return env_key
-
-    # Prioritize loading from plugin config file to have a single source of truth
-    config_path = _get_config_path()
-    if config_path.exists():
-        try:
-            with open(config_path, "r", encoding="utf-8-sig") as f:
-                config_data = json.load(f)
-                key = config_data.get("web_server", {}).get("api_key", "")
-                if key:
-                    return key
-        except Exception as e:
-            logger.error(f"从配置文件加载 API Key 失败: {e}")
-
-    return ""
-
-API_KEY = _load_api_key()
-
-DEFAULT_ALLOWED_MEDIA_DOMAINS = {
-    "multimedia.nt.qq.com.cn",
-    "gchat.qpic.cn",
-    "q.qlogo.cn",
-    "p.qlogo.cn",
-    "q1.qlogo.cn",
-    "gxh.vip.qq.com",
-}
-
-
-def _load_media_max_bytes() -> int:
-    """Load max proxied media size from env/config; default 50 MiB, clamped to 1-200 MiB."""
-    env_mb = os.environ.get("ARCHIVE_MEDIA_MAX_MB", "").strip()
-    value = env_mb
-    if not value:
-        config_path = _get_config_path()
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8-sig") as f:
-                    config_data = json.load(f)
-                    value = config_data.get("basic", {}).get("media_max_mb", 50)
-            except Exception as e:
-                logger.warning(f"读取媒体大小限制失败，使用默认值: {e}")
-                value = 50
-    try:
-        mb = int(value)
-    except (TypeError, ValueError):
-        mb = 50
-    mb = max(1, min(mb, 200))
-    return mb * 1024 * 1024
-
-
-def _load_allowed_media_domains() -> frozenset[str]:
-    env_domains = os.environ.get("ARCHIVE_ALLOWED_MEDIA_DOMAINS", "").strip()
-    domains = []
-    if env_domains:
-        domains = [part.strip() for part in env_domains.split(",")]
-    else:
-        config_path = _get_config_path()
-        if config_path.exists():
-            try:
-                with open(config_path, "r", encoding="utf-8-sig") as f:
-                    config_data = json.load(f)
-                    domains = config_data.get("basic", {}).get(
-                        "allowed_media_domains", []
-                    )
-            except Exception as e:
-                logger.warning(f"读取媒体域名白名单失败，使用默认值: {e}")
-    if isinstance(domains, str):
-        domains = [part.strip() for part in domains.split(",")]
-    cleaned = {
-        str(domain).strip().lower().rstrip(".")
-        for domain in domains
-        if str(domain).strip()
-    }
-    return frozenset(cleaned or DEFAULT_ALLOWED_MEDIA_DOMAINS)
+API_KEY = load_api_key()
 
 
 def _hostname_matches_allowlist(hostname: str, domains: frozenset[str]) -> bool:
@@ -150,7 +68,9 @@ def _hostname_matches_allowlist(hostname: str, domains: frozenset[str]) -> bool:
     return any(host == domain or host.endswith("." + domain) for domain in domains)
 
 
-def _ip_is_public(ip: ipaddress._BaseAddress) -> bool:
+def _ip_is_public(ip: ipaddress._BaseAddress, allow_fake_ip: bool = False) -> bool:
+    if allow_fake_ip and isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.IPv4Network("198.18.0.0/15"):
+        return True
     return not (
         ip.is_private
         or ip.is_loopback
@@ -163,10 +83,11 @@ def _ip_is_public(ip: ipaddress._BaseAddress) -> bool:
 
 async def _hostname_resolves_to_public_ips(hostname: str) -> bool:
     """Block localhost/private/link-local destinations before proxying media."""
+    allow_fake_ip = load_allow_fake_ip()
     try:
         try:
             ip = ipaddress.ip_address(hostname)
-            return _ip_is_public(ip)
+            return _ip_is_public(ip, allow_fake_ip=allow_fake_ip)
         except ValueError:
             pass
 
@@ -177,7 +98,7 @@ async def _hostname_resolves_to_public_ips(hostname: str) -> bool:
             return False
         for info in infos:
             ip = ipaddress.ip_address(info[4][0])
-            if not _ip_is_public(ip):
+            if not _ip_is_public(ip, allow_fake_ip=allow_fake_ip):
                 logger.warning(f"Media proxy rejected non-public DNS target {hostname} -> {ip}")
                 return False
         return True
@@ -186,8 +107,8 @@ async def _hostname_resolves_to_public_ips(hostname: str) -> bool:
         return False
 
 
-MEDIA_MAX_BYTES = _load_media_max_bytes()
-ALLOWED_MEDIA_DOMAINS = _load_allowed_media_domains()
+MEDIA_MAX_BYTES = load_media_max_bytes()
+ALLOWED_MEDIA_DOMAINS = load_allowed_media_domains()
 
 @lru_cache(maxsize=1)
 def load_right_align_ids():
@@ -243,7 +164,6 @@ app.add_middleware(
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     is_public_static = path.startswith("/static/") and not path.startswith("/static/cache/")
-
     if not API_KEY:
         # 如果 API_KEY 为空，仅允许访问登录页、验证接口和非缓存静态资源。
         if path not in ["/", "/api/auth/verify"] and not is_public_static:
@@ -323,36 +243,59 @@ def _where_clause(conditions: list[str]) -> str:
     return " WHERE " + " AND ".join(conditions)
 
 
-def _fetch_latest_sender_names(
+def _fetch_latest_sender_profiles(
     db,
     user_ids: list[str],
     conditions: list[str],
     params: list,
-) -> dict[str, str]:
+) -> dict[str, dict]:
     if not user_ids:
         return {}
     placeholders = ",".join("?" for _ in user_ids)
+    has_avatar = _table_has_columns(db, "chat_history", ("avatar_url",))
+    has_platform = _table_has_columns(db, "chat_history", ("platform_name",))
+    avatar_expr = "avatar_url" if has_avatar else "''"
+    platform_expr = "platform_name" if has_platform else "''"
+    scoped_conditions = [
+        condition for condition in conditions
+        if condition and condition != "1=1"
+    ]
     name_conditions = [
-        *conditions,
         f"user_id IN ({placeholders})",
-        "sender_name IS NOT NULL",
-        "sender_name != ''",
+        *scoped_conditions,
+        (
+            "(sender_name IS NOT NULL AND sender_name != '')"
+            if not has_avatar
+            else "((sender_name IS NOT NULL AND sender_name != '') OR (avatar_url IS NOT NULL AND avatar_url != ''))"
+        ),
     ]
     name_sql = f"""
-        SELECT user_id, sender_name
+        SELECT user_id, sender_name, avatar_url, platform_name
         FROM (
             SELECT user_id,
                    sender_name,
+                   {avatar_expr} as avatar_url,
+                   {platform_expr} as platform_name,
                    ROW_NUMBER() OVER (
                        PARTITION BY user_id
-                       ORDER BY timestamp DESC, id DESC
+                       ORDER BY
+                           CASE WHEN {avatar_expr} IS NOT NULL AND {avatar_expr} != '' THEN 0 ELSE 1 END,
+                           timestamp DESC,
+                           id DESC
                    ) as rn
             FROM chat_history {_where_clause(name_conditions)}
         ) ranked
         WHERE rn = 1
     """
-    rows = db.execute(name_sql, [*params, *user_ids]).fetchall()
-    return {str(row["user_id"]): str(row["sender_name"]) for row in rows}
+    rows = db.execute(name_sql, [*user_ids, *params]).fetchall()
+    return {
+        str(row["user_id"]): {
+            "sender_name": str(row["sender_name"] or ""),
+            "avatar_url": str(row["avatar_url"] or ""),
+            "platform_name": str(row["platform_name"] or ""),
+        }
+        for row in rows
+    }
 
 
 def _fetch_user_counts(
@@ -376,15 +319,74 @@ def _fetch_user_counts(
         return []
 
     user_ids = [str(row["user_id"]) for row in rows]
-    latest_names = _fetch_latest_sender_names(db, user_ids, conditions, params)
+    latest_profiles = _fetch_latest_sender_profiles(db, user_ids, conditions, params)
     return [
         {
             "user_id": str(row["user_id"]),
-            "sender_name": latest_names.get(str(row["user_id"])) or str(row["user_id"]),
+            "sender_name": latest_profiles.get(str(row["user_id"]), {}).get("sender_name") or str(row["user_id"]),
+            "avatar_url": latest_profiles.get(str(row["user_id"]), {}).get("avatar_url", ""),
+            "platform_name": latest_profiles.get(str(row["user_id"]), {}).get("platform_name", ""),
             "cnt": int(row["cnt"] or 0),
         }
         for row in rows
     ]
+
+
+def _fetch_latest_session_profiles(db, session_ids: list[str], bot_ids: list[str] = None) -> dict[str, dict]:
+    if not session_ids:
+        return {}
+    has_avatar = _table_has_columns(db, "chat_history", ("avatar_url",))
+    has_platform = _table_has_columns(db, "chat_history", ("platform_name",))
+    has_guild_avatar = _table_has_columns(db, "chat_history", ("guild_avatar_url",))
+    if not has_avatar and not has_platform:
+        return {}
+
+    if not bot_ids:
+        bot_ids = ["bot", "99999", "astrbot"]
+
+    placeholders = ",".join("?" for _ in session_ids)
+    bot_placeholders = ",".join("?" for _ in bot_ids)
+
+    guild_priority_expr = ""
+    if has_guild_avatar:
+        guild_priority_expr = "CASE WHEN message_type IN ('channel', 'ChannelMessage', 'group', 'GroupMessage', 'server') AND guild_avatar_url IS NOT NULL AND guild_avatar_url != '' THEN 0 ELSE 1 END,"
+
+    if has_guild_avatar:
+        avatar_expr = "CASE WHEN platform_name IN ('discord', 'kook', 'teamspeak', 'telegram') AND message_type IN ('channel', 'ChannelMessage', 'group', 'GroupMessage', 'server') THEN COALESCE(NULLIF(guild_avatar_url, ''), avatar_url) ELSE avatar_url END"
+    else:
+        avatar_expr = "avatar_url" if has_avatar else "''"
+
+    platform_column = "platform_name" if has_platform else "'' as platform_name"
+    rows = db.execute(
+        f"""
+            SELECT session_id, avatar_url, platform_name
+            FROM (
+                SELECT COALESCE(NULLIF(session_id, ''), 'legacy:archive') as session_id,
+                       {avatar_expr} as avatar_url,
+                       {platform_column},
+                       ROW_NUMBER() OVER (
+                           PARTITION BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
+                           ORDER BY
+                               {guild_priority_expr}
+                               CASE WHEN {avatar_expr} IS NOT NULL AND {avatar_expr} != '' THEN 0 ELSE 1 END,
+                               timestamp DESC,
+                               id DESC
+                       ) as rn
+                FROM chat_history
+                WHERE COALESCE(NULLIF(session_id, ''), 'legacy:archive') IN ({placeholders})
+                  AND user_id NOT IN ({bot_placeholders})
+            ) ranked
+            WHERE rn = 1
+        """,
+        [*session_ids, *bot_ids],
+    ).fetchall()
+    return {
+        str(row["session_id"]): {
+            "avatar_url": str(row["avatar_url"] or ""),
+            "platform_name": str(row["platform_name"] or ""),
+        }
+        for row in rows
+    }
 
 
 async def _close_media_upstream(response: httpx.Response | None, client: httpx.AsyncClient | None):
@@ -407,8 +409,10 @@ def _session_display_name(session_id: str, message_type: str, session_name: str 
     mt = message_type.lower()
     if "group" in mt:
         return f"群聊: {short_id}"
+    if "channel" in mt:
+        return f"频道: {short_id}"
     if "friend" in mt:
-        return f"👤 私聊: {sender_name or short_id}"
+        return sender_name or short_id
     return session_id
 
 
@@ -567,7 +571,7 @@ def _compute_dashboard(range_key: str, recent_limit: int) -> dict:
             group_rows = db.execute("""
                 SELECT session_id, session_name, message_type, message_count, last_time, last_msg, sender_name
                 FROM session_stats
-                WHERE message_type IN ('group', 'GroupMessage') OR LOWER(COALESCE(message_type, '')) LIKE '%group%'
+                WHERE message_type IN ('group', 'GroupMessage', 'channel', 'ChannelMessage') OR LOWER(COALESCE(message_type, '')) LIKE '%group%' OR LOWER(COALESCE(message_type, '')) LIKE '%channel%'
                 ORDER BY message_count DESC, last_time DESC
                 LIMIT 10
             """).fetchall()
@@ -581,7 +585,7 @@ def _compute_dashboard(range_key: str, recent_limit: int) -> dict:
                        '' as last_msg,
                        '' as sender_name
                 FROM chat_history
-                WHERE message_type IN ('group', 'GroupMessage') OR LOWER(COALESCE(message_type, '')) LIKE '%group%'
+                WHERE message_type IN ('group', 'GroupMessage', 'channel', 'ChannelMessage') OR LOWER(COALESCE(message_type, '')) LIKE '%group%' OR LOWER(COALESCE(message_type, '')) LIKE '%channel%'
                 GROUP BY COALESCE(NULLIF(session_id, ''), 'legacy:archive')
                 ORDER BY message_count DESC, last_time DESC
                 LIMIT 10
@@ -744,13 +748,22 @@ def get_history(
             params.append(time_end)
 
         where_cl = " WHERE " + " AND ".join(conditions)
+        has_avatar = _table_has_columns(db, "chat_history", ("avatar_url",))
+        has_platform = _table_has_columns(db, "chat_history", ("platform_id", "platform_name"))
+        avatar_select = "avatar_url" if has_avatar else "'' as avatar_url"
+        platform_select = (
+            "platform_id, platform_name"
+            if has_platform
+            else "'' as platform_id, '' as platform_name"
+        )
         if full_message:
             select_columns = """
                 id, user_id, sender_name, message,
                 COALESCE(LENGTH(message), 0) as message_length,
                 0 as message_truncated,
-                timestamp, session_id, message_type, session_name, msg_id, is_recalled
-            """
+                timestamp, session_id, message_type, session_name, msg_id, is_recalled,
+                {avatar_select}, {platform_select}
+            """.format(avatar_select=avatar_select, platform_select=platform_select)
             select_params = []
         else:
             select_columns = """
@@ -761,8 +774,9 @@ def get_history(
                 END as message,
                 COALESCE(LENGTH(message), 0) as message_length,
                 CASE WHEN COALESCE(LENGTH(message), 0) > ? THEN 1 ELSE 0 END as message_truncated,
-                timestamp, session_id, message_type, session_name, msg_id, is_recalled
-            """
+                timestamp, session_id, message_type, session_name, msg_id, is_recalled,
+                {avatar_select}, {platform_select}
+            """.format(avatar_select=avatar_select, platform_select=platform_select)
             select_params = [_HISTORY_MESSAGE_MAX_CHARS, _HISTORY_MESSAGE_MAX_CHARS, _HISTORY_MESSAGE_MAX_CHARS]
 
         query_conditions = list(conditions)
@@ -813,12 +827,56 @@ def get_history(
                 total = None
 
         right_ids = load_right_align_ids()
+        record_user_ids_set = {
+            str(row.get("user_id", "")).strip()
+            for row in records
+            if str(row.get("user_id", "")).strip()
+        }
+        record_user_ids = sorted(record_user_ids_set)
+
+        # Extract referenced user IDs from CQ:at codes in messages to resolve their nicknames
+        import re
+        referenced_user_ids = set()
+        for row in records:
+            msg_text = str(row.get("message") or "")
+            for match in re.finditer(r"\[CQ:at,qq=(\d+)\]", msg_text):
+                referenced_user_ids.add(match.group(1))
+
+        latest_profiles = _fetch_latest_sender_profiles(
+            db,
+            record_user_ids,
+            conditions,
+            params,
+        )
+
+        # Query globally to resolve names and avatars for all involved users (including AT'ed users)
+        all_profile_user_ids = sorted(record_user_ids_set | referenced_user_ids)
+        global_profiles = _fetch_latest_sender_profiles(
+            db,
+            all_profile_user_ids,
+            [],
+            [],
+        )
+
+        # Combine profiles: scoped takes precedence, global as fallback
+        user_profiles = {}
+        for uid in all_profile_user_ids:
+            profile = global_profiles.get(uid, {}).copy() if global_profiles.get(uid) else {}
+            if uid in latest_profiles:
+                profile.update({k: v for k, v in latest_profiles[uid].items() if v})
+            user_profiles[uid] = profile
+
         processed_records = []
         for r in records:
             item = dict(r)
             uid = str(item.get("user_id", "")).strip()
             sname = str(item.get("sender_name", "")).strip()
             msg_type = str(item.get("message_type", "")).strip().lower()
+            profile = user_profiles.get(uid, {})
+            if not item.get("avatar_url") and profile.get("avatar_url"):
+                item["avatar_url"] = profile["avatar_url"]
+            if not item.get("platform_name") and profile.get("platform_name"):
+                item["platform_name"] = profile["platform_name"]
 
             is_right = False
             is_bot = sname.lower() == "bot" or "bot" in uid.lower() or uid == "99999"
@@ -842,6 +900,7 @@ def get_history(
                 "next_cursor": next_cursor,
                 "has_more": has_more,
                 "total_exact": total_exact,
+                "user_profiles": user_profiles,
             }
         )
     except Exception as e:
@@ -931,8 +990,20 @@ async def proxy_image(url: str = Query(..., max_length=4096)):
     )
 
 
+def _find_cached_telegram_avatar(cache_dir: Path, cache_key: str) -> str:
+    if not cache_dir or not cache_dir.exists():
+        return ""
+    import hashlib
+    digest = hashlib.md5(cache_key.encode("utf-8")).hexdigest()
+    for suffix in (".jpg", ".png", ".jpeg", ".webp", ".gif"):
+        filename = f"telegram_avatar_{digest}{suffix}"
+        if (cache_dir / filename).exists():
+            return f"/static/cache/{filename}"
+    return ""
+
+
 @app.get("/api/sessions")
-def get_sessions():
+def get_sessions(request: Request):
     db = None
     try:
         db = get_db_connection()
@@ -969,32 +1040,94 @@ def get_sessions():
             """
             sessions = db.execute(query).fetchall()
 
+        plugin = getattr(request.app.state, "plugin", None)
+        bot_ids = plugin.get_bot_ids() if plugin else ["bot", "99999", "astrbot"]
+
+        session_profiles = _fetch_latest_session_profiles(
+            db,
+            [str(s["session_id"] or "legacy:archive") for s in sessions],
+            bot_ids=bot_ids,
+        )
+        friend_profile_ids = []
+        for session in sessions:
+            mt = str(session.get("message_type", "") or "").lower()
+            if "friend" in mt:
+                sid = str(session.get("session_id", "") or "")
+                friend_profile_ids.append(sid.split(":")[-1] if ":" in sid else sid)
+        friend_profiles = _fetch_latest_sender_profiles(
+            db,
+            [uid for uid in friend_profile_ids if uid],
+            [],
+            [],
+        )
         for s in sessions:
             s_id = s["session_id"]
             if s_id == "legacy:archive":
                 s["name"] = "📦 历史记录 (未分类)"
                 s["avatar"] = ""
+                s["platform_name"] = ""
                 continue
 
             name = s_id
             avatar = ""
-            if s["message_type"] in ["group", "GroupMessage"]:
+            profile = session_profiles.get(str(s_id), {})
+            profile_avatar = profile.get("avatar_url", "")
+            platform_name = str(profile.get("platform_name", "")).lower()
+            s_platform = s_id.split(":", 1)[0].lower() if ":" in s_id else platform_name
+            s["platform_name"] = platform_name or s_platform
+
+            # Check for cached Telegram avatar directly on disk first to avoid speaker avatar lock
+            if s_platform == "telegram":
+                if s["message_type"] in ["group", "GroupMessage", "channel", "ChannelMessage"]:
+                    chat_id = s_id.split(":")[-1] if ":" in s_id else s_id
+                    cached_avatar = _find_cached_telegram_avatar(cache_static_dir, f"telegram:chat:{chat_id}")
+                    if cached_avatar:
+                        profile_avatar = cached_avatar
+                elif s["message_type"] in ["friend", "FriendMessage"]:
+                    user_id = s_id.split(":")[-1] if ":" in s_id else s_id
+                    cached_avatar = _find_cached_telegram_avatar(cache_static_dir, f"telegram:user:{user_id}")
+                    if cached_avatar:
+                        profile_avatar = cached_avatar
+
+            if s["message_type"] in ["group", "GroupMessage", "channel", "ChannelMessage"]:
                 group_id = s_id.split(":")[-1] if ":" in s_id else s_id
-                avatar = f"https://p.qlogo.cn/gh/{group_id}/{group_id}/100/"
+                if profile_avatar:
+                    avatar = profile_avatar
+                elif s_platform not in ("telegram", "discord"):
+                    avatar = f"https://p.qlogo.cn/gh/{group_id}/{group_id}/100/"
 
                 db_name = s.get("session_name")
                 if db_name and db_name.strip():
                     name = db_name.strip()
                 else:
-                    name = f"群聊: {group_id}"
+                    if s["message_type"] in ["channel", "ChannelMessage"]:
+                        name = f"频道: {group_id}"
+                    else:
+                        name = f"群聊: {group_id}"
 
             elif s["message_type"] in ["friend", "FriendMessage"]:
                 user_id = s_id.split(":")[-1] if ":" in s_id else s_id
-                avatar = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=100"
-                if s["sender_name"] and s["sender_name"].strip():
-                    name = f"👤 私聊: {s['sender_name']}"
+                friend_profile = friend_profiles.get(str(user_id), {})
+                if not profile_avatar:
+                    profile_avatar = friend_profile.get("avatar_url", "")
+                    platform_name = platform_name or str(friend_profile.get("platform_name", "")).lower()
+                if profile_avatar:
+                    avatar = profile_avatar
+                elif s_platform not in ("telegram", "discord"):
+                    avatar = f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=100"
+
+                # Retrieve the friend's nickname from their profile first
+                friend_name = friend_profile.get("sender_name", "").strip()
+                db_name = s.get("session_name", "").strip()
+
+                if friend_name:
+                    name = friend_name
+                elif db_name:
+                    name = db_name
+                elif s["sender_name"] and s["sender_name"].strip() and s["sender_name"].strip().lower() != "bot":
+                    name = s["sender_name"].strip()
                 else:
-                    name = f"👤 私聊: {user_id}"
+                    name = user_id
 
             s["name"] = name
             s["avatar"] = avatar
@@ -1121,6 +1254,8 @@ def get_stats(
             top_users.append({
                 "user_id": r["user_id"],
                 "sender_name": r["sender_name"],
+                "avatar_url": r.get("avatar_url", ""),
+                "platform_name": r.get("platform_name", ""),
                 "count": r["cnt"]
             })
 
@@ -1229,7 +1364,13 @@ def get_members(
 
         rows = _fetch_user_counts(db, conditions, params, limit, offset)
         members = [
-            {"user_id": r["user_id"], "sender_name": r["sender_name"], "count": r["cnt"]}
+            {
+                "user_id": r["user_id"],
+                "sender_name": r["sender_name"],
+                "avatar_url": r.get("avatar_url", ""),
+                "platform_name": r.get("platform_name", ""),
+                "count": r["cnt"],
+            }
             for r in rows
         ]
 
@@ -1308,6 +1449,7 @@ _custom_apis_loaded = False
 class AdminServer:
     def __init__(self, plugin_instance, host: str = "127.0.0.1", port: int = 8090, api_key: str = "", cache_dir: Path = None):
         self.plugin = plugin_instance
+        app.state.plugin = plugin_instance
         self.host = os.environ.get("ARCHIVE_HOST", "").strip() or host
         try:
             self.port = int(os.environ.get("ARCHIVE_PORT", "").strip() or port)
@@ -1355,7 +1497,7 @@ if __name__ == "__main__":
     if not API_KEY:
         # Try loading from JSON config file
         try:
-            config_path = _get_config_path()
+            config_path = get_config_path()
             if config_path.exists():
                 with open(config_path, "r", encoding="utf-8-sig") as fh:
                     cfg_data = json.load(fh)

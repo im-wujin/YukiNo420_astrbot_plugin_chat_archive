@@ -34,6 +34,12 @@
                     "type": "string"
                 }
             },
+            "allow_fake_ip": {
+                "type": "bool",
+                "description": "放行 Fake-IP 保留网段",
+                "default": true,
+                "hint": "是否放行由 Clash/Mihomo 等代理软件 Fake-IP 模式解析出的保留网段 (198.18.0.0/15)。即使开启，仍需匹配允许缓存的媒体域名白名单才会下载缓存。"
+            },
             "media_max_mb": {
                 "type": "int",
                 "description": "单个媒体最大缓存体积 MB",
@@ -63,6 +69,12 @@
                 "description": "SQLite 日志模式",
                 "default": "WAL",
                 "hint": "默认 WAL 性能较好；如果数据库位于 NAS/NFS/SMB 等网络盘或遇到 database is locked，可改为 DELETE。也可用 ARCHIVE_SQLITE_JOURNAL_MODE 环境变量覆盖。可选：WAL、DELETE、TRUNCATE、PERSIST、MEMORY、OFF。"
+            },
+            "sqlite_max_connections": {
+                "type": "int",
+                "description": "SQLite 最大连接数",
+                "default": 10,
+                "hint": "SQLite 连接池最大连接数，取值会被限制在 2-64。也可用 ARCHIVE_SQLITE_MAX_CONNECTIONS 环境变量覆盖。"
             }
         }
     },

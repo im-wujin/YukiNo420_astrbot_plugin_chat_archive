@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>为 <a href="https://docs.astrbot.app/">AstrBot</a> 打造的轻量级聊天消息存档与可视化管理面板插件。</strong>
+  <strong>为 <a href="https://docs.astrbot.app/">AstrBot</a> 打造的高性能聊天消息存档与暗黑风 Web 可视化面板插件。</strong>
 </p>
 
 <p align="center">
@@ -19,8 +19,10 @@
 ## ✨ 功能特性
 
 * 🚀 **异步无感知消息存档**：采用独立的异步消息队列，消息由后台批量写入数据库，对机器人主流程零阻塞、零影响。
-* 📊 **内置 Web 可视化管理面板**：默认监听 `8090` 端口，开箱即用。支持历史消息浏览与全文检索，并提供群成员发言统计与活跃度排行等数据分析功能。
-* 🖼️ **媒体文件本地缓存**：支持将图片、视频等媒体文件下载并缓存至本地，彻底解决 QQ 原图过期失效与防盗链问题，同时内置域名白名单机制以防范 SSRF 攻击。
+* 📊 **全局可视化总览看板 (Dashboard)**：全新设计的全局可视化数据大屏，实时展现多维指标、SVG 发言活跃趋势折线图、消息类型分布及群聊活跃排行。
+* 🔍 **全站路由与全局搜索**：支持浏览器前进后退与 `?session_id` 状态深度同步。未选择特定会话时，可在总览面板直接执行跨会话的全局搜索。
+* ⚡ **极速性能分析与数据库诊断**：内置数据库文件体积监测及 SQL 子查询耗时占比实时分析；引入连接池优化与异步连接回收；通过 SQLite 增量迁移（v5）引入媒体标记、条件索引与数据补全触发器，解决大表消息扫描瓶颈。
+* 🖼️ **媒体文件本地缓存**：支持将图片、视频等媒体文件下载并缓存至本地，彻底解决 QQ 原图过期失效与防盗链问题，同时内置域名白名单与 Fake-IP 网段放行机制以防范 SSRF 攻击。
 * 🧠 **为大模型提供长期记忆**：向 LLM Agent 注册数据库检索工具，使模型能够自主查询任意时间段的历史消息，有效突破上下文长度限制。
 * 🔌 **插件扩展友好**：提供开放的 Web 路由挂载接口，其他插件可便捷地在本插件的 Web 服务上注册自定义 API 端点。
 
@@ -53,11 +55,13 @@
 | `ignored_users` | `[]` | 不希望被记录的用户 ID 列表（如机器人自身的 QQ 号）。 |
 | `cache_media` | `false` | 是否开启媒体本地缓存。 |
 | `allowed_media_domains` | QQ 媒体域名白名单 | 允许缓存/代理的媒体域名及其子域名，防止 SSRF 访问内网。 |
+| `allow_fake_ip` | `true` | 是否放行由 Clash/Mihomo 等代理软件 Fake-IP 模式解析出的保留网段 (`198.18.0.0/15`)，防止局域网安全策略的意外拦截。 |
 | `media_max_mb` | `50` | 单个媒体缓存/代理的最大体积，范围 1–200 MB。 |
 | `enable_clean` | `false` | 是否定期自动清理过期的媒体缓存文件。 |
 | `clean_days` | `30` | 缓存文件保留的最大天数，超期文件将被自动删除。 |
 | `db_path` | `""` | 自定义数据库路径，支持环境变量与 `~` 展开，留空使用默认位置。 |
 | `sqlite_journal_mode` | `WAL` | SQLite 日志模式。NAS/NFS/SMB 等网络盘可尝试 `DELETE`。 |
+| `sqlite_max_connections` | `10` | SQLite 连接池最大连接数，范围 2-64。 |
 
 ### WebUI 面板设置（`web_server`）
 
@@ -78,8 +82,10 @@
 | `ARCHIVE_DATA_DIR` | 覆盖插件数据目录。 |
 | `ARCHIVE_CONFIG_PATH` | 覆盖 AstrBot 插件配置 JSON 路径。 |
 | `ARCHIVE_ALLOWED_MEDIA_DOMAINS` | 逗号分隔的媒体域名白名单。 |
+| `ARCHIVE_ALLOW_FAKE_IP` | 覆盖是否放行 Fake-IP 保留网段。 |
 | `ARCHIVE_MEDIA_MAX_MB` | 覆盖单个媒体最大体积。 |
 | `ARCHIVE_SQLITE_JOURNAL_MODE` | 覆盖 SQLite 日志模式。 |
+| `ARCHIVE_SQLITE_MAX_CONNECTIONS` | 覆盖 SQLite 连接池最大连接数。 |
 | `ARCHIVE_CORS_ORIGINS` | 逗号分隔的允许跨域来源。 |
 
 ---
