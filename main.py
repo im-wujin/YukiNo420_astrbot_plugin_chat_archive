@@ -632,7 +632,7 @@ class ChatArchivePlugin(Star):
     def _extract_from_dirty_str(s, key):
         return ArchiveEventExtractor.extract_from_dirty_str(s, key)
 
-    @filter.event_message_type(EventMessageType.ALL)
+    @filter.event_message_type(EventMessageType.ALL, priority=3)
     async def record_message(self, event: AstrMessageEvent):
         """
         拦截所有的消息事件，并存档至数据库。
